@@ -1,0 +1,19 @@
+services:
+  bot:
+    build: .
+    image: telegram-media-downloader:latest
+    container_name: telegram-media-downloader
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      # Polling needs no public domain or HTTPS. Remove it to use a webhook instead.
+      TELEGRAM_POLLING: "1"
+    ports:
+      # Bound to localhost only; polling does not require inbound access.
+      - "127.0.0.1:3000:3000"
+    security_opt:
+      - no-new-privileges:true

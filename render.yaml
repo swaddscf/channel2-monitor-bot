@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: telegram-media-downloader
+    runtime: docker
+    plan: free
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # Polling needs no public domain or HTTPS.
+      - key: TELEGRAM_POLLING
+        value: "1"
+      # Secrets: Render prompts for these on first deploy (sync: false).
+      - key: BOT_TOKEN
+        sync: false
+      - key: OWNER_ID
+        sync: false

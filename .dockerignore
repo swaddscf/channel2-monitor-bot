@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.git/
+.gitignore
+.env
+.env.*
+*.session
+*.log
+.manus-logs/
+client/__manus__/
+README.md
+todo.md
+production-verification.md
+facebook-link-investigation.md

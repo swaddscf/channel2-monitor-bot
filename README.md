@@ -57,12 +57,13 @@ pnpm dev
 
 ## النشر المجاني 24/7
 
-لتشغيل البوت دائماً دون تكلفة، أمامك مسارَان مفصلان:
+لتشغيل البوت دائماً دون تكلفة، اتبع أنسب دليل لحالتك (كلها وضع Polling بلا دومين أو HTTPS):
 
-- الأسهل: [`RENDER_DEPLOY.md`](./RENDER_DEPLOY.md) — رفع من GitHub وبناء Docker على Render المجاني + منبّه منع النوم.
-- الأضمن 24/7: [`DEPLOY_FREE.md`](./DEPLOY_FREE.md) — جهاز Oracle Cloud Always Free + Docker + وضع Polling.
+- **بلا بطاقة ائتمان (الأسهل):** [`BACK4APP_DEPLOY.md`](./BACK4APP_DEPLOY.md) — Back4App Containers المجاني من GitHub + منبّه منع النوم. بديل احتياطي فيه: ClawCloud Run.
+- Render: [`RENDER_DEPLOY.md`](./RENDER_DEPLOY.md) — لكن Render يطلب بطاقة للتحقق حالياً.
+- الأضمن 24/7 (يتطلب بطاقة للتحقق): [`DEPLOY_FREE.md`](./DEPLOY_FREE.md) — جهاز Oracle Cloud Always Free + Docker.
 
-كلاهما بلا دومين أو HTTPS. أو استخدم `docker compose up -d --build` على أي خادم دائم.
+أو استخدم `docker compose up -d --build` على أي خادم دائم.
 
 ## تفعيل Webhook بعد النشر
 

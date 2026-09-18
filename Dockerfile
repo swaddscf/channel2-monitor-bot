@@ -19,6 +19,8 @@ WORKDIR /app
 
 ENV NODE_ENV=production
 ENV PORT=3000
+# Keep the Node heap small so the bot also fits tiny free tiers (256 MB RAM).
+ENV NODE_OPTIONS=--max-old-space-size=192
 
 # Runtime system dependencies: ffmpeg (media muxing), python3/pip (yt-dlp), zip (project archive export)
 RUN apt-get update \

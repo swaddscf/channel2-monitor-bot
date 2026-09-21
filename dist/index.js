@@ -8,166 +8,6 @@ var __export = (target, all) => {
     __defProp(target, name, { get: all[name], enumerable: true });
 };
 
-// vite.config.ts
-var vite_config_exports = {};
-__export(vite_config_exports, {
-  default: () => vite_config_default
-});
-import { jsxLocPlugin } from "@builder.io/vite-plugin-jsx-loc";
-import tailwindcss from "@tailwindcss/vite";
-import react from "@vitejs/plugin-react";
-import fs from "node:fs";
-import path2 from "node:path";
-import { defineConfig } from "vite";
-import { vitePluginManusRuntime } from "vite-plugin-manus-runtime";
-function ensureLogDir() {
-  if (!fs.existsSync(LOG_DIR)) {
-    fs.mkdirSync(LOG_DIR, { recursive: true });
-  }
-}
-function trimLogFile(logPath, maxSize) {
-  try {
-    if (!fs.existsSync(logPath) || fs.statSync(logPath).size <= maxSize) {
-      return;
-    }
-    const lines = fs.readFileSync(logPath, "utf-8").split("\n");
-    const keptLines = [];
-    let keptBytes = 0;
-    const targetSize = TRIM_TARGET_BYTES;
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const lineBytes = Buffer.byteLength(`${lines[i]}
-`, "utf-8");
-      if (keptBytes + lineBytes > targetSize) break;
-      keptLines.unshift(lines[i]);
-      keptBytes += lineBytes;
-    }
-    fs.writeFileSync(logPath, keptLines.join("\n"), "utf-8");
-  } catch {
-  }
-}
-function writeToLogFile(source, entries) {
-  if (entries.length === 0) return;
-  ensureLogDir();
-  const logPath = path2.join(LOG_DIR, `${source}.log`);
-  const lines = entries.map((entry) => {
-    const ts = (/* @__PURE__ */ new Date()).toISOString();
-    return `[${ts}] ${JSON.stringify(entry)}`;
-  });
-  fs.appendFileSync(logPath, `${lines.join("\n")}
-`, "utf-8");
-  trimLogFile(logPath, MAX_LOG_SIZE_BYTES);
-}
-function vitePluginManusDebugCollector() {
-  return {
-    name: "manus-debug-collector",
-    transformIndexHtml(html) {
-      if (process.env.NODE_ENV === "production") {
-        return html;
-      }
-      return {
-        html,
-        tags: [
-          {
-            tag: "script",
-            attrs: {
-              src: "/__manus__/debug-collector.js",
-              defer: true
-            },
-            injectTo: "head"
-          }
-        ]
-      };
-    },
-    configureServer(server) {
-      server.middlewares.use("/__manus__/logs", (req, res, next) => {
-        if (req.method !== "POST") {
-          return next();
-        }
-        const handlePayload = (payload) => {
-          if (payload.consoleLogs?.length > 0) {
-            writeToLogFile("browserConsole", payload.consoleLogs);
-          }
-          if (payload.networkRequests?.length > 0) {
-            writeToLogFile("networkRequests", payload.networkRequests);
-          }
-          if (payload.sessionEvents?.length > 0) {
-            writeToLogFile("sessionReplay", payload.sessionEvents);
-          }
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ success: true }));
-        };
-        const reqBody = req.body;
-        if (reqBody && typeof reqBody === "object") {
-          try {
-            handlePayload(reqBody);
-          } catch (e) {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ success: false, error: String(e) }));
-          }
-          return;
-        }
-        let body = "";
-        req.on("data", (chunk) => {
-          body += chunk.toString();
-        });
-        req.on("end", () => {
-          try {
-            const payload = JSON.parse(body);
-            handlePayload(payload);
-          } catch (e) {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ success: false, error: String(e) }));
-          }
-        });
-      });
-    }
-  };
-}
-var PROJECT_ROOT, LOG_DIR, MAX_LOG_SIZE_BYTES, TRIM_TARGET_BYTES, plugins, vite_config_default;
-var init_vite_config = __esm({
-  "vite.config.ts"() {
-    "use strict";
-    PROJECT_ROOT = import.meta.dirname;
-    LOG_DIR = path2.join(PROJECT_ROOT, ".manus-logs");
-    MAX_LOG_SIZE_BYTES = 1 * 1024 * 1024;
-    TRIM_TARGET_BYTES = Math.floor(MAX_LOG_SIZE_BYTES * 0.6);
-    plugins = [react(), tailwindcss(), jsxLocPlugin(), vitePluginManusRuntime(), vitePluginManusDebugCollector()];
-    vite_config_default = defineConfig({
-      plugins,
-      resolve: {
-        alias: {
-          "@": path2.resolve(import.meta.dirname, "client", "src"),
-          "@shared": path2.resolve(import.meta.dirname, "shared"),
-          "@assets": path2.resolve(import.meta.dirname, "attached_assets")
-        }
-      },
-      envDir: path2.resolve(import.meta.dirname),
-      root: path2.resolve(import.meta.dirname, "client"),
-      publicDir: path2.resolve(import.meta.dirname, "client", "public"),
-      build: {
-        outDir: path2.resolve(import.meta.dirname, "dist/public"),
-        emptyOutDir: true
-      },
-      server: {
-        host: true,
-        allowedHosts: [
-          ".manuspre.computer",
-          ".manus.computer",
-          ".manus-asia.computer",
-          ".manuscomputer.ai",
-          ".manusvm.computer",
-          "localhost",
-          "127.0.0.1"
-        ],
-        fs: {
-          strict: true,
-          deny: ["**/.*"]
-        }
-      }
-    });
-  }
-});
-
 // server/telegram/policy.ts
 function canAdmitNewUser(activeUserCount, maxUsers, role) {
   return Boolean(role) || activeUserCount < maxUsers;
@@ -222,7 +62,7 @@ __export(botDb_exports, {
   updateMaxUsers: () => updateMaxUsers,
   updateMediaJob: () => updateMediaJob
 });
-import { nanoid as nanoid2 } from "nanoid";
+import { nanoid } from "nanoid";
 function configuredPrimaryOwnerId() {
   return (process.env.OWNER_ID || "").trim();
 }
@@ -297,7 +137,7 @@ async function touchAndAdmitUser(from) {
   return { admission: "active", isNew: true };
 }
 async function createMediaJob(telegramId, sourceUrl, platform) {
-  const id = nanoid2(18);
+  const id = nanoid(18);
   store.jobs.set(id, {
     id,
     telegramId,
@@ -1260,11 +1100,11 @@ function detectStoryLink(rawUrl) {
   try {
     const url = new URL(rawUrl);
     const hostname = url.hostname.toLowerCase().replace(/^www\./, "");
-    const path7 = url.pathname.toLowerCase();
-    if (belongsToHost(hostname, "instagram.com")) return /^\/stories\//.test(path7);
-    if (belongsToHost(hostname, "facebook.com")) return path7.includes("/stories/") || path7.startsWith("/stories");
+    const path6 = url.pathname.toLowerCase();
+    if (belongsToHost(hostname, "instagram.com")) return /^\/stories\//.test(path6);
+    if (belongsToHost(hostname, "facebook.com")) return path6.includes("/stories/") || path6.startsWith("/stories");
     if (belongsToHost(hostname, "snapchat.com")) {
-      return /^\/(?:@[^/]+\/)?(?:spotlight|highlight)\//.test(path7) || /^\/t\//.test(path7);
+      return /^\/(?:@[^/]+\/)?(?:spotlight|highlight)\//.test(path6) || /^\/t\//.test(path6);
     }
     return false;
   } catch {
@@ -1471,58 +1311,20 @@ async function createContext(opts) {
   };
 }
 
-// server/_core/vite.ts
+// server/_core/serveStatic.ts
 import express from "express";
-import fs2 from "fs";
-import { nanoid } from "nanoid";
-import path3 from "path";
-async function setupVite(app, server) {
-  const { createServer: createViteServer } = await import("vite");
-  const { default: viteConfig } = await Promise.resolve().then(() => (init_vite_config(), vite_config_exports));
-  const serverOptions = {
-    middlewareMode: true,
-    hmr: { server },
-    allowedHosts: true
-  };
-  const vite = await createViteServer({
-    ...viteConfig,
-    configFile: false,
-    server: serverOptions,
-    appType: "custom"
-  });
-  app.use(vite.middlewares);
-  app.use("*", async (req, res, next) => {
-    const url = req.originalUrl;
-    try {
-      const clientTemplate = path3.resolve(
-        import.meta.dirname,
-        "../..",
-        "client",
-        "index.html"
-      );
-      let template = await fs2.promises.readFile(clientTemplate, "utf-8");
-      template = template.replace(
-        `src="/src/main.tsx"`,
-        `src="/src/main.tsx?v=${nanoid()}"`
-      );
-      const page = await vite.transformIndexHtml(url, template);
-      res.status(200).set({ "Content-Type": "text/html" }).end(page);
-    } catch (e) {
-      vite.ssrFixStacktrace(e);
-      next(e);
-    }
-  });
-}
+import fs from "fs";
+import path2 from "path";
 function serveStatic(app) {
-  const distPath = process.env.NODE_ENV === "development" ? path3.resolve(import.meta.dirname, "../..", "dist", "public") : path3.resolve(import.meta.dirname, "public");
-  if (!fs2.existsSync(distPath)) {
+  const distPath = process.env.NODE_ENV === "development" ? path2.resolve(import.meta.dirname, "../..", "dist", "public") : path2.resolve(import.meta.dirname, "public");
+  if (!fs.existsSync(distPath)) {
     console.error(
       `Could not find the build directory: ${distPath}, make sure to build the client first`
     );
   }
   app.use(express.static(distPath));
   app.use("*", (_req, res) => {
-    res.sendFile(path3.resolve(distPath, "index.html"));
+    res.sendFile(path2.resolve(distPath, "index.html"));
   });
 }
 
@@ -1533,11 +1335,11 @@ init_botDb();
 import { spawn as spawn2 } from "node:child_process";
 import { mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
-import path5 from "node:path";
+import path4 from "node:path";
 
 // server/telegram/tiktokProfile.ts
 import { spawn } from "node:child_process";
-import path4 from "node:path";
+import path3 from "node:path";
 var PROFILE_CACHE_TTL_MS = 6 * 60 * 60 * 1e3;
 var profileCache = /* @__PURE__ */ new Map();
 var pythonAvailable;
@@ -1804,7 +1606,7 @@ function isPythonAvailable() {
 }
 async function fetchViaPython(url) {
   if (!await isPythonAvailable()) return void 0;
-  const scriptPath = path4.resolve(process.cwd(), "scripts", "tiktok_profile.py");
+  const scriptPath = path3.resolve(process.cwd(), "scripts", "tiktok_profile.py");
   const result = await runWithTimeout("python3", [scriptPath, url], 15e3);
   if (result.code !== 0 || !result.stdout) return void 0;
   const trimmed = result.stdout.trim();
@@ -2239,8 +2041,8 @@ async function inspectMediaLink(rawUrl, jobId) {
 async function downloadMedia(rawUrl, choice, jobId) {
   let { url, platform } = inspectSupportedUrl(rawUrl);
   if (platform === "tiktok") url = await resolveTikTokPublicUrl(url);
-  const workdir = await mkdtemp(path5.join(os.tmpdir(), `telegram-media-${jobId}-`));
-  const output = path5.join(workdir, "media.%(ext)s");
+  const workdir = await mkdtemp(path4.join(os.tmpdir(), `telegram-media-${jobId}-`));
+  const output = path4.join(workdir, "media.%(ext)s");
   if (choice === "image") {
     try {
       const metadata = await loadMetadata(url.toString(), jobId);
@@ -2255,7 +2057,7 @@ async function downloadMedia(rawUrl, choice, jobId) {
       const bytes = Buffer.from(await response.arrayBuffer());
       if (bytes.byteLength > MAX_MEDIA_BYTES) throw new DownloaderError("\u062D\u062C\u0645 \u0627\u0644\u0635\u0648\u0631\u0629 \u0623\u0643\u0628\u0631 \u0645\u0646 \u0627\u0644\u062D\u062F \u0627\u0644\u0622\u0645\u0646 \u0644\u0644\u0625\u0631\u0633\u0627\u0644 \u0639\u0628\u0631 \u0627\u0644\u0628\u0648\u062A.");
       const extension = contentType.includes("png") ? "png" : contentType.includes("webp") ? "webp" : "jpg";
-      const filePath = path5.join(workdir, `media.${extension}`);
+      const filePath = path4.join(workdir, `media.${extension}`);
       await writeFile(filePath, bytes);
       return { workdir, filePath, bytes: bytes.byteLength };
     } catch (error) {
@@ -2272,7 +2074,7 @@ async function downloadMedia(rawUrl, choice, jobId) {
   args.push(url.toString());
   try {
     await runYtDlpWithRetry(args, DOWNLOAD_TIMEOUT_MS, jobId);
-    const files = (await readdir(workdir)).filter((file) => !file.endsWith(".part") && !file.endsWith(".ytdl")).map((file) => path5.join(workdir, file));
+    const files = (await readdir(workdir)).filter((file) => !file.endsWith(".part") && !file.endsWith(".ytdl")).map((file) => path4.join(workdir, file));
     if (!files.length) throw new DownloaderError("\u0627\u0643\u062A\u0645\u0644 \u0627\u0644\u0637\u0644\u0628 \u062F\u0648\u0646 \u0645\u0644\u0641 \u0642\u0627\u0628\u0644 \u0644\u0644\u0625\u0631\u0633\u0627\u0644.");
     const candidate = files[0];
     const fileInfo = await stat(candidate);
@@ -2332,7 +2134,7 @@ init_policy();
 import { execFile } from "node:child_process";
 import { mkdtemp as mkdtemp2, rm as rm2, stat as stat2 } from "node:fs/promises";
 import os2 from "node:os";
-import path6 from "node:path";
+import path5 from "node:path";
 import { promisify } from "node:util";
 var execFileAsync = promisify(execFile);
 var MAX_ARCHIVE_BYTES = 45 * 1024 * 1024;
@@ -2364,7 +2166,7 @@ var ProjectArchiveError = class extends Error {
 async function availableProjectEntries(projectRoot) {
   const entries = await Promise.all(PROJECT_ENTRIES.map(async (entry) => {
     try {
-      await stat2(path6.join(projectRoot, entry));
+      await stat2(path5.join(projectRoot, entry));
       return entry;
     } catch {
       return void 0;
@@ -2375,8 +2177,8 @@ async function availableProjectEntries(projectRoot) {
 async function createProjectArchive(projectRoot = process.cwd()) {
   const entries = await availableProjectEntries(projectRoot);
   if (!entries.length) throw new ProjectArchiveError("\u062A\u0639\u0630\u0631 \u0627\u0644\u0639\u062B\u0648\u0631 \u0639\u0644\u0649 \u0645\u0644\u0641\u0627\u062A \u0627\u0644\u0645\u0634\u0631\u0648\u0639 \u0627\u0644\u0642\u0627\u0628\u0644\u0629 \u0644\u0644\u062A\u0635\u062F\u064A\u0631 \u0641\u064A \u0628\u064A\u0626\u0629 \u0627\u0644\u0627\u0633\u062A\u0636\u0627\u0641\u0629.");
-  const workdir = await mkdtemp2(path6.join(os2.tmpdir(), "telegram-project-export-"));
-  const archivePath = path6.join(workdir, "telegram-media-downloader-project.zip");
+  const workdir = await mkdtemp2(path5.join(os2.tmpdir(), "telegram-project-export-"));
+  const archivePath = path5.join(workdir, "telegram-media-downloader-project.zip");
   try {
     await execFileAsync("zip", ["-q", "-r", archivePath, ...entries], {
       cwd: projectRoot,
@@ -3244,6 +3046,7 @@ async function startServer() {
   if (isProductionRuntime()) {
     serveStatic(app);
   } else {
+    const { setupVite } = await import("./vite");
     await setupVite(app, server);
   }
   const preferredPort = parseInt(process.env.PORT || "3000");

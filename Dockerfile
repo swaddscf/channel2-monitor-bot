@@ -26,7 +26,10 @@ RUN echo '{ \
     "jose":"^6.1.0", \
     "zod":"^3.24.0", \
     "superjson":"^1.13.0", \
-    "nanoid":"^5.1.0" \
+    "nanoid":"^5.1.0", \
+    "axios":"^1.12.0", \
+    "drizzle-orm":"^0.44.0", \
+    "mysql2":"^3.15.0" \
   } \
 }' > package.json \
   && npm install --omit=dev --legacy-peer-deps --maxsockets=2 \

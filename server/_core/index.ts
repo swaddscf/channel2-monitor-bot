@@ -7,7 +7,7 @@ import { registerOAuthRoutes } from "./oauth";
 import { registerStorageProxy } from "./storageProxy";
 import { appRouter } from "../routers";
 import { createContext } from "./context";
-import { serveStatic, setupVite } from "./vite";
+import { serveStatic } from "./serveStatic";
 import { registerTelegramRoutes } from "../telegram/routes";
 import { registerTelegramCleanupRoute } from "../telegram/cleanupRoute";
 import { cleanupStaleJobs } from "../telegram/botDb";
@@ -72,6 +72,7 @@ async function startServer() {
   if (isProductionRuntime()) {
     serveStatic(app);
   } else {
+    const { setupVite } = await import("./vite");
     await setupVite(app, server);
   }
 

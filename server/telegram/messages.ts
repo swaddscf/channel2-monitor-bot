@@ -1,4 +1,5 @@
 import type { InspectResult } from "./types";
+import { countryLabel, formatCount } from "./tiktokProfile";
 
 export type ButtonStyle = "primary" | "success" | "danger";
 
@@ -9,15 +10,18 @@ export function escapeHtml(value: string) {
 export function welcomeText(name: string) {
   return `✦ أهلاً <b>${escapeHtml(name)}</b>
 
-أنا بوت تنزيل الوسائط العامة. أرسل رابطاً واحداً وسأعرض الخيارات المتاحة: <b>فيديو</b> أو <b>صوت</b> أو <b>صورة أصلية</b>.
+أنا بوت تنزيل الوسائط العامة. أرسل رابطاً واحداً وسأعرض الخيارات المتاحة: <b>فيديو</b> أو <b>صوت</b> أو <b>صورة أصلية</b> أو <b>ستوري</b>.
 
 <b>المنصات المدعومة</b>
 TikTok • Instagram • Facebook • Snapchat • Pinterest • Twitter/X
 
+<b>على TikTok أعرض لك أيضاً بطاقة الحساب</b>
+الاسم، اسم المستخدم، المتابعين، المنشورات، والدولة — بشكل حقيقي من بيانات الحساب العام.
+
 <b>بثلاث خطوات</b>
 ① انسخ رابط المنشور أو الفيديو أو القصة العامة.
 ② أرسله هنا كما هو، من دون إضافة نص آخر.
-③ اختر فيديو أو صوتاً أو صورة عندما يؤكد المصدر توافرها.
+③ اختر فيديو أو صوتاً أو صورة أو ستوري عندما يؤكد المصدر توافرها.
 
 لا أقبل الحسابات الخاصة أو المحتوى المحمي. استخدم الروابط العامة التي تملك حق تنزيلها فقط.`;
 }
@@ -26,7 +30,9 @@ export const HELP_TEXT = `❔ <b>كيف أستخدم البوت؟</b>
 
 أرسل رابطاً عاماً واحداً فقط. يدعم البوت TikTok وInstagram وFacebook وSnapchat وPinterest وTwitter/X. في Twitter/X استخدم رابط المنشور بصيغة <code>https://x.com/اسم_المستخدم/status/123</code>، وليس رابط الحساب.
 
-بعد الفحص ستظهر الأزرار المناسبة: فيديو أو صوت أو صورة أصلية. لا يظهر الخيار إلا عندما يؤكد المصدر وجوده. قصص Snapchat وInstagram وFacebook لا تعمل إلا إذا كان الرابط عاماً وما زال المصدر يتيحه.
+بعد الفحص ستظهر الأزرار المناسبة: فيديو أو صوت أو صورة أصلية أو ستوري. لا يظهر الخيار إلا عندما يؤكد المصدر وجوده. قصص Instagram وFacebook وSnapchat تظهر عبر زر <b>تنزيل الستوري</b> إذا كان الرابط عاماً وما زال المصدر يتيحه.
+
+على روابط TikTok يُعرض أيضاً كشف حساب الناشر عند توفر البيانات: الاسم، اسم المستخدم، عدد المتابعين والمنشورات والدولة.
 
 استخدم زر <b>إلغاء العملية</b> لإيقاف الفحص أو التنزيل الحالي. للبلاغات، اضغط <b>إرسال بلاغ</b> وأرسل الرابط مع السبب.
 
@@ -97,10 +103,32 @@ export function inspectionText(result: InspectResult) {
     pinterest: "Pinterest",
     twitter: "Twitter/X",
   };
+  let accountBlock = "";
+  const account = result.account;
+  if (account) {
+    const lines: string[] = [];
+    if (account.nickname || account.username) lines.push(`👤 <b>${escapeHtml(account.nickname || account.username!)}</b>`);
+    if (account.username) {
+      const verifiedMark = account.verified ? " ✅ موثق" : "";
+      lines.push(`معرّف: <code>@${escapeHtml(account.username)}</code>${verifiedMark}`);
+    } else if (account.verified) {
+      lines.push("✅ حساب موثق");
+    }
+    const stats: string[] = [];
+    if (account.followers !== undefined) stats.push(`👥 <b>${formatCount(account.followers)}</b> متابع`);
+    if (account.posts !== undefined) stats.push(`📹 <b>${formatCount(account.posts)}</b> منشور`);
+    if (account.hearts !== undefined) stats.push(`❤️ <b>${formatCount(account.hearts)}</b> إعجاب`);
+    if (stats.length) lines.push(stats.join(" • "));
+    const region = countryLabel(account.region);
+    if (region) lines.push(`📍 الدولة: <b>${escapeHtml(region)}</b>`);
+    if (account.signature) lines.push(`✍️ ${escapeHtml(account.signature.slice(0, 150))}`);
+    if (account.profileUrl) lines.push(`🔗 <code>${escapeHtml(account.profileUrl)}</code>`);
+    accountBlock = `\n\n${lines.join("\n")}`;
+  }
   return `✦ <b>تم فحص الرابط</b>
 
 المنصة: <b>${platformLabels[result.platform]}</b>
-العنوان: <b>${escapeHtml(result.title)}</b>${duration}
+العنوان: <b>${escapeHtml(result.title)}</b>${duration}${accountBlock}
 
 اختر نوع الملف المناسب. لا يُعرض إلا ما أكده الفحص من هذا الرابط العام.`;
 }
@@ -109,6 +137,7 @@ const MEDIA_BUTTONS: Record<InspectResult["choices"][number], { text: string; st
   video: { text: "🎬 تنزيل فيديو", style: "primary", iconEnv: "BUTTON_CUSTOM_EMOJI_DOWNLOAD" },
   audio: { text: "🎵 تنزيل صوت", style: "success", iconEnv: "BUTTON_CUSTOM_EMOJI_AUDIO" },
   image: { text: "🖼 تنزيل صورة أصلية", style: "primary", iconEnv: "BUTTON_CUSTOM_EMOJI_IMAGE" },
+  story: { text: "📖 تنزيل الستوري", style: "success", iconEnv: "BUTTON_CUSTOM_EMOJI_STORY" },
 };
 
 export function mediaChoiceKeyboard(jobId: string, choices: InspectResult["choices"]) {

@@ -2,7 +2,8 @@ import { spawn } from "node:child_process";
 import { mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { inspectSupportedUrl, normalizeTikTokMediaUrl } from "./validation";
+import { detectStoryLink, inspectSupportedUrl, normalizeTikTokMediaUrl } from "./validation";
+import { loadTikTokAccount, mergeAccounts } from "./tiktokProfile";
 import type { InspectResult, MediaChoice } from "./types";
 
 const INSPECT_TIMEOUT_MS = 70_000;
@@ -275,7 +276,15 @@ async function loadMetadata(rawUrl: string, jobId?: string) {
 
 export async function inspectMediaLink(rawUrl: string, jobId?: string): Promise<InspectResult> {
   const { platform } = inspectSupportedUrl(rawUrl);
-  const metadata = await loadMetadata(rawUrl, jobId);
+  const isStory = detectStoryLink(rawUrl);
+  const accountPromise = platform === "tiktok"
+    ? loadTikTokAccount(rawUrl).catch(() => undefined)
+    : Promise.resolve(undefined);
+  const [metadata, account, story] = await Promise.all([
+    loadMetadata(rawUrl, jobId),
+    accountPromise,
+    Promise.resolve(isStory),
+  ]);
   const formats = Array.isArray(metadata.formats) ? metadata.formats as Array<Record<string, unknown>> : [];
   const directExtension = String(metadata.ext || "").toLowerCase();
   const directIsImage = imageExtensions.includes(directExtension);
@@ -289,7 +298,7 @@ export async function inspectMediaLink(rawUrl: string, jobId?: string): Promise<
   });
   const hasImage = hasImageFormat || Boolean(imageUrlsFromMetadata(metadata).length);
   const choices: MediaChoice[] = [];
-  if (hasVideo) choices.push("video");
+  if (hasVideo) choices.push(story ? "story" : "video");
   if (hasAudio) choices.push("audio");
   if (hasImage) choices.push("image");
   if (!choices.length && platform === "twitter") {
@@ -301,13 +310,21 @@ export async function inspectMediaLink(rawUrl: string, jobId?: string): Promise<
   }
   if (!choices.length) throw new DownloaderError("لم يؤكد المصدر وجود فيديو أو صوت أو صورة عامة قابلة للإرسال. قد يكون المنشور خاصاً أو قصة منتهية أو ألبوماً لا يتيح المصدر استخراج وسائطه.");
 
-  return {
+  const enrichedAccount = mergeAccounts(
+    account,
+    typeof metadata.channel === "string" && metadata.channel.trim() ? { nickname: metadata.channel.trim() } : undefined,
+    typeof metadata.uploader === "string" && metadata.uploader.trim() ? { username: metadata.uploader.trim().replace(/^@/, "") } : undefined,
+  );
+
+  const result: InspectResult = {
     platform,
     title: cleanTitle(metadata.title),
     choices,
     durationSeconds: typeof metadata.duration === "number" ? metadata.duration : undefined,
     thumbnail: imageUrlFromMetadata(metadata),
   };
+  if (enrichedAccount) result.account = enrichedAccount;
+  return result;
 }
 
 export async function downloadMedia(rawUrl: string, choice: MediaChoice, jobId: string) {

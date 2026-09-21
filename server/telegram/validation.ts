@@ -73,6 +73,22 @@ export function inspectSupportedUrl(rawUrl: string): { url: URL; platform: Suppo
   throw new PublicLinkError("هذا الرابط غير مدعوم. أرسل رابطاً عاماً من TikTok أو Instagram أو Facebook أو Snapchat أو Pinterest أو Twitter/X.");
 }
 
+export function detectStoryLink(rawUrl: string) {
+  try {
+    const url = new URL(rawUrl);
+    const hostname = url.hostname.toLowerCase().replace(/^www\./, "");
+    const path = url.pathname.toLowerCase();
+    if (belongsToHost(hostname, "instagram.com")) return /^\/stories\//.test(path);
+    if (belongsToHost(hostname, "facebook.com")) return path.includes("/stories/") || path.startsWith("/stories");
+    if (belongsToHost(hostname, "snapchat.com")) {
+      return /^\/(?:@[^/]+\/)?(?:spotlight|highlight)\//.test(path) || /^\/t\//.test(path);
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 export function isSafeWebhookSecret(value: string | undefined): value is string {
   return Boolean(value && /^[A-Za-z0-9_-]{1,256}$/.test(value));
 }

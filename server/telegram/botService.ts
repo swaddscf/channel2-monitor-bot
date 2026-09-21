@@ -57,7 +57,7 @@ function keyboardFor(primary: boolean) {
 }
 
 function mediaLabel(choice?: string | null) {
-  return choice === "video" ? "فيديو" : choice === "audio" ? "صوت" : choice === "image" ? "صورة" : "وسيط غير محدد";
+  return choice === "video" ? "فيديو" : choice === "audio" ? "صوت" : choice === "image" ? "صورة" : choice === "story" ? "قصة" : "وسيط غير محدد";
 }
 
 function errorText(error: unknown) {
@@ -401,14 +401,14 @@ async function handleDownloadCallback(callback: TelegramCallbackQuery) {
     return;
   }
   const [, jobId, rawChoice] = data.split(":");
-  if (!jobId || !["video", "audio", "image"].includes(rawChoice)) return answerCallbackQuery(callback.id, "طلب غير صالح");
+  if (!jobId || !["video", "audio", "image", "story"].includes(rawChoice)) return answerCallbackQuery(callback.id, "طلب غير صالح");
   if (!allowCallback(senderId)) return answerCallbackQuery(callback.id, "💡 أنت تضغط بسرعة. انتظر قليلاً ثم أعد المحاولة.");
   const choice = rawChoice as MediaChoice;
   const job = await getMediaJob(jobId);
   if (!job || job.telegramId !== senderId || job.status !== "ready" || job.cancelRequested) return answerCallbackQuery(callback.id, "انتهت صلاحية هذا الطلب");
   await answerCallbackQuery(callback.id, "بدأ تجهيز الملف");
   await updateMediaJob(jobId, { status: "downloading", selectedChoice: choice });
-  const action: "upload_video" | "upload_audio" | "upload_photo" = choice === "video" ? "upload_video" : choice === "audio" ? "upload_audio" : "upload_photo";
+  const action: "upload_video" | "upload_audio" | "upload_photo" = choice === "video" || choice === "story" ? "upload_video" : choice === "audio" ? "upload_audio" : "upload_photo";
   let workdir: string | undefined;
   let preserveRetryJob = false;
   let deleteJobOnFinish = true;
@@ -430,7 +430,7 @@ async function handleDownloadCallback(callback: TelegramCallbackQuery) {
     await sendChatAction(chatId, action).catch(() => undefined);
     await sendDownloadedMedia(chatId, choice, output.filePath, "✅ <b>اكتمل التنزيل</b> — الملف أُرسل بنجاح وسيُحذف من الخادم الآن.");
     await updateMediaJob(jobId, { status: "sent" });
-    await notifyOwners(`✅ <b>تنزيل مكتمل</b>\nالمستخدم: <code>${senderId}</code>\nالنوع: <b>${choice === "video" ? "فيديو" : choice === "audio" ? "صوت" : "صورة"}</b>\nالحجم: <b>${Math.round(output.bytes / 1024)} KB</b>\nالرابط: <code>${escapeHtml(job.sourceUrl.slice(0, 500))}</code>`);
+    await notifyOwners(`✅ <b>تنزيل مكتمل</b>\nالمستخدم: <code>${senderId}</code>\nالنوع: <b>${mediaLabel(choice)}</b>\nالحجم: <b>${Math.round(output.bytes / 1024)} KB</b>\nالرابط: <code>${escapeHtml(job.sourceUrl.slice(0, 500))}</code>`);
   } catch (error) {
     if (error instanceof DownloaderError && error.message === "تم إلغاء العملية بنجاح.") return;
     if (error instanceof DownloadQueueError) {

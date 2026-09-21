@@ -1,6 +1,20 @@
 export type SupportedPlatform = "tiktok" | "instagram" | "facebook" | "snapchat" | "pinterest" | "twitter";
 
-export type MediaChoice = "video" | "audio" | "image";
+export type MediaChoice = "video" | "audio" | "image" | "story";
+
+export type TikTokAccount = {
+  nickname?: string;
+  username?: string;
+  followers?: number;
+  following?: number;
+  posts?: number;
+  hearts?: number;
+  region?: string;
+  verified?: boolean;
+  signature?: string;
+  avatarUrl?: string;
+  profileUrl?: string;
+};
 
 export type InspectResult = {
   platform: SupportedPlatform;
@@ -8,6 +22,7 @@ export type InspectResult = {
   choices: MediaChoice[];
   durationSeconds?: number;
   thumbnail?: string;
+  account?: TikTokAccount;
 };
 
 export type TelegramFrom = {

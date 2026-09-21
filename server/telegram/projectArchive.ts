@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const MAX_ARCHIVE_BYTES = 45 * 1024 * 1024;
 const PROJECT_ENTRIES = [
-  "client", "server", "drizzle", "shared", "patches",
+  "client", "server", "drizzle", "shared", "patches", "scripts",
   "package.json", "pnpm-lock.yaml", "tsconfig.json", "vite.config.ts", "drizzle.config.ts", "components.json",
   "Dockerfile", "README.md", "todo.md", "facebook-link-investigation.md", "production-verification.md",
 ];

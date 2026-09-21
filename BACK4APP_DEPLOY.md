@@ -12,6 +12,30 @@ Back4App Web Deployment يوفّر طبقة مجانية **بدون بطاقة �
 
 > ملاحظة: الطبقة المجانية قد تُنيم الحاوية بعد فترة خمول. الحل: منبّه مجاني (UptimeRobot) يزور الرابط كل 5–10 دقائق (الخطوة 5).
 
+## 0) أنشئ/جدّد توكن البوت من BotFather (إلزامي قبل النشر)
+
+> التوكن الحالي في `.env` **قديم وملغى** (طلبات الويب تخفق بـ401). أنشئ توكن جديداً ولا تُظهره لأحد.
+
+1. افتح <https://t.me/BotFather> على تلغرام واضغط **Start**.
+2. نفّذ الأمر <code>/newbot</code> واختر اسماً معروضاً ثم يوزرنيم ينتهي بـ`bot` (مثل `MediaSaferBot`).
+3. انسخ النص بعد **Use this token to access the HTTP API** (صيغته `123456789:AABB...`).
+4. (اختياري) لاستخدام أحدث طريقة تفاعل: نفّذ <code>/newbot</code> ثم من إعداد البوت اختر Inline Keyboard.
+5. هذا التوكن الجديد هو قيمة `BOT_TOKEN` — لا تضعه في ملف مرفوع إلى GitHub، بل في متغيرات البيئة عند النشر (الخطوة 3).
+
+## 0.5) ارفع المشروع إلى GitHub من Windows (مرة واحدة)
+
+1. أنشئ مستودعاً جديداً على GitHub (مثل `tg-media-downloader`) — **بدون** إضافة ملفات README أو .gitignore عند الإنشاء.
+2. من PowerShell داخل مجلد المشروع:
+
+```powershell
+git remote -v
+git remote add origin https://github.com/اسمك/tg-media-downloader.git   # إن لم يكن موجوداً
+git branch -M main
+git push -u origin main
+```
+
+3. سيُطلب تسجيل الدخول (GitHub CLI أو PAT). إن واجهت خطأ حول الملفات الكبيرة، لا تضغط `.env` إطلاقاً (تحقق: `git status` يجب ألا يُظهر `.env`، فهو في `.gitignore`).
+
 ## 1) أنشئ الحساب
 
 1. افتح <https://www.back4app.com> واضغط **Sign Up**.

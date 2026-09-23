@@ -2486,7 +2486,7 @@ function configNumber(name, fallback, min, max) {
   return Math.max(min, Math.min(max, Math.floor(raw)));
 }
 function maxConcurrent() {
-  return configNumber("DOWNLOAD_MAX_CONCURRENT", 8, 1, 64);
+  return configNumber("DOWNLOAD_MAX_CONCURRENT", 2, 1, 64);
 }
 function maxWaiting() {
   return configNumber("DOWNLOAD_MAX_WAITING", 1e3, 10, 5e4);

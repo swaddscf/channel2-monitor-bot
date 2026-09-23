@@ -61,6 +61,8 @@ git push -u origin main
 | `TELEGRAM_POLLING` | `1` |
 | `NODE_ENV` | `production` |
 | `PORT` | `3000` |
+| `DOWNLOAD_MAX_CONCURRENT` | `2` (التنزيل الثقيل يستهلك ذاكرة؛ لا ترفعه فوق 2 على 256MB) |
+| `DOWNLOAD_MAX_WAITING` | `1000` (الطلبات تنتظر بالترتيب ولا تُفقد مع ضغط عالٍ) |
 
 > في Dockerfile لدينا `NODE_OPTIONS=--max-old-space-size=192` ليتحمّل حدّ 256MB. اتركه.
 

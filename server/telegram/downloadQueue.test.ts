@@ -40,7 +40,7 @@ describe("صف التنزيل", () => {
   it("يقرأ حدود التزامن من متغيرات البيئة ويرفع السعة للضغط العالي", () => {
     delete process.env.DOWNLOAD_MAX_CONCURRENT;
     delete process.env.DOWNLOAD_MAX_WAITING;
-    expect(getDownloadQueueStats()).toMatchObject({ maxConcurrent: 8, maxWaiting: 1000 });
+    expect(getDownloadQueueStats()).toMatchObject({ maxConcurrent: 2, maxWaiting: 1000 });
     process.env.DOWNLOAD_MAX_CONCURRENT = "8";
     process.env.DOWNLOAD_MAX_WAITING = "12";
   });

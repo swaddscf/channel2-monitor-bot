@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import dns from "node:dns";
 import net from "node:net";
 import path from "node:path";
+import { renderWelcomeBanner } from "./welcomeImage";
 import type { MediaChoice, TelegramUpdate } from "./types";
 
 const API_ROOT = "https://api.telegram.org";
@@ -99,6 +100,79 @@ export async function sendProjectArchive(chatId: string, localPath: string, capt
   form.set("parse_mode", "HTML");
   form.set("document", new Blob([file as unknown as BlobPart]), path.basename(localPath));
   return telegramRequest<number>("sendDocument", form);
+}
+
+export type ChatMember = {
+  status?: string;
+  user?: { id?: number };
+};
+
+export async function getChatMember(chatId: string, userId: number | string) {
+  return telegramRequest<ChatMember>(
+    "getChatMember",
+    JSON.stringify({ chat_id: chatId, user_id: userId }),
+    { "content-type": "application/json" },
+  );
+}
+
+export async function getChat(chatId: string) {
+  return telegramRequest<{ bio?: string; first_name?: string; username?: string; language_code?: string; id?: number | string }>(
+    "getChat",
+    JSON.stringify({ chat_id: chatId }),
+    { "content-type": "application/json" },
+  );
+}
+
+export async function sendPhoto(chatId: string, photo: { url: string } | { buffer: Buffer }, caption = "") {
+  const form = new FormData();
+  form.set("chat_id", chatId);
+  if (caption) {
+    form.set("caption", caption);
+    form.set("parse_mode", "HTML");
+  }
+  if ("url" in photo) {
+    form.set("photo", photo.url);
+  } else {
+    form.set("photo", new Blob([photo.buffer as unknown as BlobPart]), "welcome.png");
+  }
+  return telegramRequest<number>("sendPhoto", form);
+}
+
+export async function sendWelcomePhoto(chatId: string) {
+  if ((process.env.WELCOME_DISABLE_PHOTO || "").trim() === "1") return false;
+  const customUrl = process.env.WELCOME_PHOTO_URL?.trim();
+  if (customUrl) {
+    await sendPhoto(chatId, { url: customUrl });
+    return true;
+  }
+  await sendPhoto(chatId, { buffer: renderWelcomeBanner() });
+  return true;
+}
+
+export async function sendMediaGroup(chatId: string, files: Array<{ path: string; caption?: string }>) {
+  const CHUNK_SIZE = 10;
+  let sent = 0;
+  for (let start = 0; start < files.length; start += CHUNK_SIZE) {
+    const chunk = files.slice(start, start + CHUNK_SIZE);
+    const form = new FormData();
+    form.set("chat_id", chatId);
+    const media = chunk.map((file, index) => {
+      const input: Record<string, unknown> = { type: "photo", media: `attach://file${index}` };
+      if (index === 0 && file.caption) {
+        input.caption = file.caption;
+        input.parse_mode = "HTML";
+      }
+      return input;
+    });
+    form.set("media", JSON.stringify(media));
+    for (let index = 0; index < chunk.length; index += 1) {
+      const file = await readFile(chunk[index].path);
+      form.set(`file${index}`, new Blob([file as unknown as BlobPart]), path.basename(chunk[index].path));
+    }
+    await telegramRequest<number>("sendMediaGroup", form);
+    sent += chunk.length;
+  }
+  return sent;
 }
 
 export async function getWebhookInfo() {

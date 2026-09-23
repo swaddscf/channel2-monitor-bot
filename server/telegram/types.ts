@@ -22,6 +22,7 @@ export type InspectResult = {
   choices: MediaChoice[];
   durationSeconds?: number;
   thumbnail?: string;
+  imageCount?: number;
   account?: TikTokAccount;
 };
 
@@ -51,4 +52,15 @@ export type TelegramUpdate = {
   update_id: number;
   message?: TelegramMessage;
   callback_query?: TelegramCallbackQuery;
+};
+
+export type ForcedSubscriptionKind = "channel" | "group" | "bot";
+
+export type ForcedSubscription = {
+  id: string;
+  target: string;
+  inviteUrl: string;
+  label: string;
+  kind: ForcedSubscriptionKind;
+  createdAt: Date;
 };

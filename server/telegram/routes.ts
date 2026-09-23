@@ -1,5 +1,6 @@
 import type { Express, Request, Response } from "express";
 import { processTelegramUpdate } from "./botService";
+import { isPollingEnabled } from "./polling";
 import { getWebhookSecret } from "./secrets";
 import { getTelegramIntegrationStatus } from "./status";
 import { matchesWebhookSecret } from "./validation";
@@ -26,6 +27,9 @@ export function registerTelegramRoutes(app: Express) {
   });
 
   app.post("/api/telegram/activate", async (req: Request, res: Response) => {
+    if (isPollingEnabled()) {
+      return res.status(409).json({ ok: false, error: "polling mode is enabled; remove TELEGRAM_POLLING to use the webhook and avoid duplicated updates" });
+    }
     const status = await getTelegramIntegrationStatus();
     const secret = getWebhookSecret();
     const forwardedProtocol = req.header("x-forwarded-proto")?.split(",")[0]?.trim();

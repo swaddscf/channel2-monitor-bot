@@ -12,6 +12,7 @@ dist/
 # Logs / runtime
 *.log
 .manus-logs/
+data/
 
 # Secrets & sessions (never commit)
 *.session

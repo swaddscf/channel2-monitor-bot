@@ -1,5 +1,5 @@
 import { timingSafeEqual } from "node:crypto";
-import type { SupportedPlatform } from "./types";
+import type { ForcedSubscriptionKind, SupportedPlatform } from "./types";
 
 const PLATFORM_HOSTS: Record<SupportedPlatform, string[]> = {
   tiktok: ["tiktok.com"],
@@ -98,4 +98,48 @@ export function matchesWebhookSecret(expected: string | undefined, supplied: str
   const expectedValue = Buffer.from(expected);
   const suppliedValue = Buffer.from(supplied);
   return expectedValue.length === suppliedValue.length && timingSafeEqual(expectedValue, suppliedValue);
+}
+
+export type SubscriptionTarget = {
+  target: string;
+  inviteUrl: string;
+  label: string;
+  kind: ForcedSubscriptionKind;
+};
+
+export function parseSubscriptionTarget(rawInput: string): SubscriptionTarget {
+  const input = rawInput.trim();
+  if (!input) throw new PublicLinkError("أرسل معرّف القناة أو @username أو رابط t.me.");
+  let target: string;
+  let inviteUrl: string;
+  const tmeMatch = input.match(/^(?:https?:\/\/)?(?:www\.)?(?:t|telegram)\.me\/([^\s/?]+)/i);
+  if (tmeMatch) {
+    const rawName = tmeMatch[1].replace(/^@/, "");
+    if (rawName.startsWith("+") || /^joinchat\//.test(rawName)) {
+      throw new PublicLinkError("روابط الدعوة الخاصة (+...) لا يمكن فحص الاشتراك منها. أرسل @username أو المعرّف الرقمي للقناة بدلاً منها.");
+    }
+    target = rawName;
+    inviteUrl = `https://t.me/${rawName}`;
+  } else if (input.startsWith("@")) {
+    target = input.slice(1);
+    if (!/^[A-Za-z0-9_]{4,32}$/.test(target)) throw new PublicLinkError("اسم المستخدم غير صالح داخل Telegram.");
+    inviteUrl = `https://t.me/${target}`;
+  } else if (/^-?\d{6,}$/.test(input)) {
+    target = input;
+    inviteUrl = "";
+  } else {
+    if (!/^[A-Za-z0-9_]{4,32}$/.test(input)) throw new PublicLinkError("اسم المستخدم غير صالح داخل Telegram.");
+    target = input;
+    inviteUrl = `https://t.me/${input}`;
+  }
+  const kind = resolveSubscriptionKind(target);
+  const label = inviteUrl ? `@${target}` : `ID: ${target}`;
+  return { target, inviteUrl, label, kind };
+}
+
+function resolveSubscriptionKind(target: string): ForcedSubscriptionKind {
+  if (/^-100\d+$/.test(target)) return "channel";
+  if (/^-\d+$/.test(target)) return "group";
+  if (/[bB]ot$/.test(target)) return "bot";
+  return "channel";
 }

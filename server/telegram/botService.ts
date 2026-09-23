@@ -1,16 +1,16 @@
-import { cancelLatestActiveJob, cancelMediaJob, claimTelegramUpdate, createMediaJob, deleteMediaJob, ensurePrimaryOwner, getMediaJob, isPrimaryOwner, recordBotError, touchAndAdmitUser, updateMediaJob } from "./botDb";
-import { abortYtDlp, downloadMedia, DownloaderError, inspectMediaLink, purgeDownloadedMedia } from "./downloader";
+import { addForcedSubscription, cancelLatestActiveJob, cancelMediaJob, claimTelegramUpdate, createMediaJob, deleteMediaJob, ensurePrimaryOwner, getMediaJob, getOwnerRole, getTelegramUser, isPrimaryOwner, listForcedSubscriptions, recordBotError, removeForcedSubscription, touchAndAdmitUser, updateMediaJob } from "./botDb";
+import { abortYtDlp, downloadAllImages, downloadMedia, DownloaderError, inspectMediaLink, purgeDownloadedMedia } from "./downloader";
 import { DownloadQueueError, getDownloadQueueStats, scheduleDownload } from "./downloadQueue";
 import { isValidTelegramUpdateId } from "./policy";
-import { PublicLinkError, inspectSupportedUrl } from "./validation";
-import { answerCallbackQuery, sendChatAction, sendDownloadedMedia, sendMessage, sendProjectArchive } from "./telegramApi";
-import { createProjectArchive, purgeProjectArchive } from "./projectArchive";
+import { inspectSupportedUrl, parseSubscriptionTarget, PublicLinkError } from "./validation";
+import { answerCallbackQuery, getChatMember, sendChatAction, sendDownloadedMedia, sendMediaGroup, sendMessage, sendWelcomePhoto } from "./telegramApi";
 import type { MediaChoice, TelegramCallbackQuery, TelegramMessage, TelegramUpdate } from "./types";
-import { escapeHtml, HELP_TEXT, inspectionText, mediaChoiceKeyboard, OWNER_KEYBOARD, REPORT_TEXT, retryTikTokKeyboard, USER_KEYBOARD, welcomeText } from "./messages";
+import { escapeHtml, HELP_TEXT, inspectionText, mediaChoiceKeyboard, OWNER_CLEANUP_KEYBOARD, OWNER_KEYBOARD, OWNER_SETTINGS_KEYBOARD, OWNER_SUBSCRIPTIONS_KEYBOARD, OWNER_USERS_KEYBOARD, REPORT_TEXT, retryTikTokKeyboard, subscriptionGateKeyboard, subscriptionGateText, USER_KEYBOARD, welcomeText, type WelcomeUserInfo } from "./messages";
 
 const recentRequests = new Map<string, number[]>();
-const pendingAdminInputs = new Map<string, { action: "ban" | "unban" | "limit" | "cleanup" | "broadcast" | "addOwner" | "removeOwner"; expiresAt: number }>();
+const pendingAdminInputs = new Map<string, { action: "ban" | "unban" | "cleanup" | "broadcast" | "addChannel" | "removeChannel"; expiresAt: number }>();
 const pendingReports = new Map<string, number>();
+const ownerPageStacks = new Map<string, string[]>();
 let primaryOwnerEnsured = false;
 const legacyOwnerLabels: Record<string, string> = {
   "✅ الحاضرون": "✅ النشطون",
@@ -19,15 +19,14 @@ const legacyOwnerLabels: Record<string, string> = {
   "📣 رسالة جماعية": "📣 إرسال للجميع",
   "⚙️ حد المستخدمين": "⚙️ سعة البوت",
   "🗓 إعداد التنظيف": "⏱️ مدة التنظيف",
-  "🧹 تنظيف البيانات": "🧹 تنظيف الآن",
+  "🧹 تنظيف البيانات": "🧹 تنظيف البيانات",
   "📋 سجلات الأخطاء": "📋 أخطاء حديثة",
-  "📦 نسخة المشروع": "📦 تحميل نسخة المشروع",
 };
 const ownerControlLabels = new Set([
-  "📊 الإحصاءات", "👥 آخر المستخدمين", "✅ النشطون", "🌙 غير النشطين", "🚫 المحظورون",
-  "🧹 تنظيف الآن", "📋 أخطاء حديثة", "👑 الملاك", "🛑 إلغاء العملية", "↩️ إلغاء الإدخال",
-  "🚫 حظر مستخدم", "✅ فك الحظر", "⚙️ سعة البوت", "⏱️ مدة التنظيف", "📣 إرسال للجميع",
-  "➕ إضافة مالك", "➖ حذف مالك", "📦 تحميل نسخة المشروع", "/admin",
+  "📊 الإحصاءات", "👥 إدارة المستخدمين", "👥 آخر المستخدمين", "✅ النشطون", "🌙 غير النشطين", "🚫 المحظورون",
+  "🚫 حظر مستخدم", "✅ فك الحظر", "🔒 الاشتراك الإجباري", "➕ إضافة قناة/بوت", "➖ إزالة قناة/بوت", "📋 قائمة الاشتراك",
+  "⚙️ الإعدادات", "⏱️ مدة التنظيف", "🧹 تنظيف البيانات", "🧹 تنظيف الآن", "📣 إرسال للجميع", "📋 أخطاء حديثة",
+  "↩️ رجوع", "🏠 الرئيسية", "🛑 إلغاء العملية", "↩️ إلغاء الإدخال", "/admin",
 ]);
 
 function allowRequest(telegramId: string) {
@@ -91,8 +90,26 @@ function isRetryableTikTokFailure(error: unknown, platform?: string) {
   return /TikTok.*(حماية المصدر|رفض|تعذر الوصول)|\[TikTok\].*Unexpected response from webpage request|Unexpected response from webpage request/i.test(message);
 }
 
-function beginAdminInput(telegramId: string, action: "ban" | "unban" | "limit" | "cleanup" | "broadcast" | "addOwner" | "removeOwner") {
+function beginAdminInput(telegramId: string, action: "ban" | "unban" | "cleanup" | "broadcast" | "addChannel" | "removeChannel") {
   pendingAdminInputs.set(telegramId, { action, expiresAt: Date.now() + 10 * 60_000 });
+}
+
+function ownerStack(telegramId: string) {
+  let stack = ownerPageStacks.get(telegramId);
+  if (!stack) {
+    stack = ["main"];
+    ownerPageStacks.set(telegramId, stack);
+  }
+  return stack;
+}
+
+function ownerKeyboardFor(telegramId: string) {
+  const current = ownerStack(telegramId)[ownerStack(telegramId).length - 1];
+  if (current === "users") return OWNER_USERS_KEYBOARD;
+  if (current === "settings") return OWNER_SETTINGS_KEYBOARD;
+  if (current === "subscriptions") return OWNER_SUBSCRIPTIONS_KEYBOARD;
+  if (current === "cleanup") return OWNER_CLEANUP_KEYBOARD;
+  return OWNER_KEYBOARD;
 }
 
 function normalizeOwnerLabel(text: string) {
@@ -149,15 +166,27 @@ async function admitMessage(message: TelegramMessage) {
     await sendMessage(String(message.chat.id), "عذراً، لا يمكنك استخدام هذا البوت حالياً.");
     return { admitted: false, primary: false };
   }
-  if (admission.admission === "capacity") {
-    await sendMessage(String(message.chat.id), "عذراً، وصل البوت إلى الحد الأقصى. حاول لاحقاً بعد التنظيف التلقائي.");
-    return { admitted: false, primary: false };
-  }
   const primary = await isPrimaryOwner(telegramId);
   if (admission.isNew) {
     await notifyOwners(`👤 <b>مستخدم جديد</b>\nالاسم: <b>${escapeHtml(userName(message))}</b>\nالمعرّف: <code>${telegramId}</code>${message.from.username ? `\nالمعرف: @${escapeHtml(message.from.username)}` : ""}`);
   }
   return { admitted: true, primary };
+}
+
+async function checkForcedSubscriptions(telegramId: string) {
+  const subscriptions = await listForcedSubscriptions();
+  if (!subscriptions.length) return [] as typeof subscriptions;
+  const missing: typeof subscriptions = [];
+  for (const subscription of subscriptions) {
+    if (subscription.kind === "bot") continue;
+    let member = false;
+    try {
+      const chatMember = await getChatMember(subscription.target, telegramId);
+      member = ["creator", "administrator", "member"].includes(chatMember.status || "");
+    } catch { member = false; }
+    if (!member) missing.push(subscription);
+  }
+  return missing;
 }
 
 async function inspectIncomingLink(message: TelegramMessage, rawUrl: string, primary: boolean) {
@@ -176,7 +205,7 @@ async function inspectIncomingLink(message: TelegramMessage, rawUrl: string, pri
     const job = await getMediaJob(jobId);
     if (!job || job.cancelRequested) return;
     await updateMediaJob(jobId, { status: "ready", choicesJson: JSON.stringify(result.choices) });
-    await sendMessage(chatId, inspectionText(result), { replyMarkup: mediaChoiceKeyboard(jobId, result.choices) });
+    await sendMessage(chatId, inspectionText(result), { replyMarkup: mediaChoiceKeyboard(jobId, result.choices, result.imageCount) });
   } catch (error) {
     if (error instanceof DownloaderError && error.message === "تم إلغاء العملية بنجاح.") return;
     const retryableTikTok = isRetryableTikTokFailure(error, platform);
@@ -191,32 +220,101 @@ async function inspectIncomingLink(message: TelegramMessage, rawUrl: string, pri
 }
 
 function formatStats(stats: Awaited<ReturnType<typeof import("./botDb")["botStats"]>>) {
-  return `📊 <b>إحصاءات سريعة</b>\n\nالمستخدمون: <b>${stats.total}</b> / ${stats.settings.maxUsers}\nالنشطون اليوم: <b>${stats.activeToday}</b>\nالجدد اليوم: <b>${stats.joinedToday}</b>\nالمحظورون: <b>${stats.blocked}</b>\nغير النشطين: <b>${stats.inactive}</b>\nالتنظيف بعد: <b>${stats.settings.cleanupInactiveDays} يوماً</b>`;
+  return `📊 <b>إحصاءات سريعة</b>\n\nالمستخدمون: <b>${stats.total}</b>\nالنشطون اليوم: <b>${stats.activeToday}</b>\nالجدد اليوم: <b>${stats.joinedToday}</b>\nالمحظورون: <b>${stats.blocked}</b>\nغير النشطين: <b>${stats.inactive}</b>\nالتنظيف بعد: <b>${stats.settings.cleanupInactiveDays} يوماً</b>`;
 }
 
-async function sendAdminPanel(chatId: string) {
-  await sendMessage(chatId, "👑 <b>لوحة المالك الأساسية</b>\nاختر وظيفة من الأزرار. عند الحاجة لرقم أو نص سأطلبه منك في رسالة منفصلة؛ لا تحتاج إلى حفظ الأوامر.", { replyMarkup: OWNER_KEYBOARD });
+async function sendAdminPanel(chatId: string, telegramId: string) {
+  ownerStack(telegramId).length = 0;
+  ownerStack(telegramId).push("main");
+  await sendMessage(chatId, "👑 <b>لوحة المالك الأساسية</b>\nاختر وظيفة من الأزرار. عند الحاجة لرقم أو نص سأطلبه منك في رسالة منفصلة.", { replyMarkup: OWNER_KEYBOARD });
 }
 
-async function sendUserList(chatId: string, title: string, users: Awaited<ReturnType<typeof import("./botDb")["listTelegramUsers"]>>) {
-  if (!users.length) return sendMessage(chatId, `لا توجد نتائج في قائمة «${title}».`, { replyMarkup: OWNER_KEYBOARD });
+async function sendUserList(chatId: string, title: string, users: Awaited<ReturnType<typeof import("./botDb")["listTelegramUsers"]>>, replyMarkup: Record<string, unknown>) {
+  if (!users.length) return sendMessage(chatId, `لا توجد نتائج في قائمة «${title}».`, { replyMarkup });
   const lines = users.map((user, index) => `${index + 1}. <b>${escapeHtml(user.displayName)}</b>${user.username ? ` (@${escapeHtml(user.username)})` : ""}\n<code>${user.telegramId}</code> — ${user.status === "blocked" ? "محظور" : "نشط"}`);
-  return sendMessage(chatId, `👥 <b>${title}</b>\n\n${lines.join("\n")}`, { replyMarkup: OWNER_KEYBOARD });
+  return sendMessage(chatId, `👥 <b>${title}</b>\n\n${lines.join("\n")}`, { replyMarkup });
+}
+
+function pendingInputPrompt(action: "ban" | "unban" | "cleanup" | "broadcast" | "addChannel" | "removeChannel") {
+  const prompts: Record<typeof action, string> = {
+    ban: "أرسل الآن رقم المستخدم أو @username لحظره.",
+    unban: "أرسل الآن رقم المستخدم أو @username لفك الحظر.",
+    cleanup: "أرسل عدد الأيام قبل تنظيف غير النشطين، من 7 إلى 365.",
+    broadcast: "أرسل الآن نص الرسالة. ستصل للمستخدمين النشطين فقط.",
+    addChannel: "أرسل معرف القناة أو المجموعة أو البوت:\n- @username\n- أو رقم القناة\n- أو رابط t.me/username",
+    removeChannel: "أرسل معرف القناة أو @username أو معرّفها من قائمة الاشتراك.",
+  };
+  return prompts[action];
 }
 
 async function handleOwnerButton(message: TelegramMessage, text: string) {
   const chatId = String(message.chat.id);
   const telegramId = String(message.from!.id);
   text = normalizeOwnerLabel(text);
-  if (text === "📊 الإحصاءات") { const { botStats } = await import("./botDb"); await sendMessage(chatId, formatStats(await botStats()), { replyMarkup: OWNER_KEYBOARD }); return true; }
-  if (text === "👥 آخر المستخدمين") { const { listTelegramUsers } = await import("./botDb"); await sendUserList(chatId, "آخر 50 مستخدماً", await listTelegramUsers("recent")); return true; }
-  if (text === "✅ النشطون") { const { listTelegramUsers } = await import("./botDb"); await sendUserList(chatId, "المستخدمون النشطون", await listTelegramUsers("active")); return true; }
-  if (text === "🌙 غير النشطين") { const { listTelegramUsers } = await import("./botDb"); await sendUserList(chatId, "المستخدمون غير النشطين", await listTelegramUsers("inactive")); return true; }
-  if (text === "🚫 المحظورون") { const { listTelegramUsers } = await import("./botDb"); await sendUserList(chatId, "المستخدمون المحظورون", await listTelegramUsers("blocked")); return true; }
+  const replyMarkup = ownerKeyboardFor(telegramId);
+
+  if (text === "↩️ رجوع") {
+    const stack = ownerStack(telegramId);
+    if (stack.length > 1) stack.pop();
+    await sendMessage(chatId, "↩️ <b>رجوع</b>", { replyMarkup: ownerKeyboardFor(telegramId) });
+    return true;
+  }
+  if (text === "🏠 الرئيسية") {
+    const stack = ownerStack(telegramId);
+    stack.length = 0;
+    stack.push("main");
+    await sendMessage(chatId, "🏠 <b>الرئيسية</b>", { replyMarkup: OWNER_KEYBOARD });
+    return true;
+  }
+  if (text === "👥 إدارة المستخدمين") {
+    ownerStack(telegramId).push("users");
+    await sendMessage(chatId, "👥 <b>إدارة المستخدمين</b>\nالقوائم، الحظر، وفك الحظر.", { replyMarkup: OWNER_USERS_KEYBOARD });
+    return true;
+  }
+  if (text === "🔒 الاشتراك الإجباري") {
+    ownerStack(telegramId).push("subscriptions");
+    await sendMessage(chatId, "🔒 <b>الاشتراك الإجباري</b>\nأضف القنوات أو المجموعات أو البوتات المطلوبة قبل استخدام البوت. ملكية العضوية تُفحص تلقائياً قبل تنزيل أي رابط.", { replyMarkup: OWNER_SUBSCRIPTIONS_KEYBOARD });
+    return true;
+  }
+  if (text === "⚙️ الإعدادات") {
+    ownerStack(telegramId).push("settings");
+    await sendMessage(chatId, "⚙️ <b>الإعدادات</b>", { replyMarkup: OWNER_SETTINGS_KEYBOARD });
+    return true;
+  }
+  if (text === "🧹 تنظيف البيانات") {
+    ownerStack(telegramId).push("cleanup");
+    await sendMessage(chatId, "🧹 <b>تنظيف البيانات</b>", { replyMarkup: OWNER_CLEANUP_KEYBOARD });
+    return true;
+  }
+  if (text === "📊 الإحصاءات") {
+    const { botStats } = await import("./botDb");
+    await sendMessage(chatId, formatStats(await botStats()), { replyMarkup: OWNER_KEYBOARD });
+    return true;
+  }
+  if (text === "👥 آخر المستخدمين") {
+    const { listTelegramUsers } = await import("./botDb");
+    await sendUserList(chatId, "آخر 50 مستخدماً", await listTelegramUsers("recent"), replyMarkup);
+    return true;
+  }
+  if (text === "✅ النشطون") {
+    const { listTelegramUsers } = await import("./botDb");
+    await sendUserList(chatId, "المستخدمون النشطون", await listTelegramUsers("active"), replyMarkup);
+    return true;
+  }
+  if (text === "🌙 غير النشطين") {
+    const { listTelegramUsers } = await import("./botDb");
+    await sendUserList(chatId, "المستخدمون غير النشطين", await listTelegramUsers("inactive"), replyMarkup);
+    return true;
+  }
+  if (text === "🚫 المحظورون") {
+    const { listTelegramUsers } = await import("./botDb");
+    await sendUserList(chatId, "المستخدمون المحظورون", await listTelegramUsers("blocked"), replyMarkup);
+    return true;
+  }
   if (text === "🧹 تنظيف الآن") {
     const { cleanupBotData } = await import("./botDb");
     const result = await cleanupBotData();
-    await sendMessage(chatId, `تم التنظيف. أزيلت سجلات <b>${result.removedInactiveUsers}</b> مستخدم غير نشط والعمليات المؤقتة المنتهية.`, { replyMarkup: OWNER_KEYBOARD });
+    await sendMessage(chatId, `تم التنظيف. أزيلت سجلات <b>${result.removedInactiveUsers}</b> مستخدم غير نشط والعمليات المؤقتة المنتهية.`, { replyMarkup });
     return true;
   }
   if (text === "📋 أخطاء حديثة") {
@@ -225,49 +323,46 @@ async function handleOwnerButton(message: TelegramMessage, text: string) {
     await sendMessage(chatId, errors.length ? `📋 <b>آخر الأخطاء</b>\n\n${errors.map(error => `• <b>${escapeHtml(error.stage)}</b> — <code>${escapeHtml(error.telegramId || "—")}</code>\n${escapeHtml(error.message.slice(0, 160))}`).join("\n\n")}` : "لا توجد أخطاء مسجلة حالياً.", { replyMarkup: OWNER_KEYBOARD });
     return true;
   }
-  if (text === "👑 الملاك") {
-    const { listOwners } = await import("./botDb");
-    const owners = await listOwners();
-    await sendMessage(chatId, `👑 <b>الملاك والتنبيهات</b>\n${owners.map(owner => `• <code>${owner.telegramId}</code> — ${owner.role === "primary" ? "المالك الأساسي" : "يتلقى التنبيهات"}`).join("\n")}`, { replyMarkup: OWNER_KEYBOARD });
+  if (text === "📋 قائمة الاشتراك") {
+    const subscriptions = await listForcedSubscriptions();
+    if (!subscriptions.length) {
+      await sendMessage(chatId, "لا توجد قنوات اشتراك مفروضة حالياً.", { replyMarkup: OWNER_SUBSCRIPTIONS_KEYBOARD });
+      return true;
+    }
+    const lines = subscriptions.map((subscription, index) => {
+      const kindLabel = subscription.kind === "group" ? "مجموعة" : subscription.kind === "bot" ? "بوت" : "قناة";
+      const link = subscription.inviteUrl ? `<a href="${escapeHtml(subscription.inviteUrl)}">${escapeHtml(subscription.label)}</a>` : `<code>${escapeHtml(subscription.label)}</code>`;
+      return `${index + 1}. (${kindLabel}) ${link}\n   <code>${escapeHtml(subscription.target)}</code>`;
+    }).join("\n");
+    const note = subscriptions.some(subscription => subscription.kind === "bot")
+      ? "\n\nℹ️ لا توجد واجهة عامة للتحقق من بدء المستخدم لبوت؛ يُعتبر اشتراك البوت مكتملاً دائماً."
+      : "";
+    await sendMessage(chatId, `🔒 <b>قائمة الاشتراك الإجباري (${subscriptions.length})</b>\n\n${lines}${note}\n\nللإزالة اضغط «إزالة قناة/بوت» وأرسل نفس المعرّف.`, { replyMarkup: OWNER_SUBSCRIPTIONS_KEYBOARD });
     return true;
   }
   if (text === "🛑 إلغاء العملية") {
     const { cancelLatestActiveJob } = await import("./botDb");
     const cancelled = await cancelLatestActiveJob(telegramId);
     if (cancelled) abortYtDlp(cancelled);
-    await sendMessage(chatId, cancelled ? "تم إلغاء آخر عملية نشطة." : "لا توجد عملية قابلة للإلغاء.", { replyMarkup: OWNER_KEYBOARD });
+    await sendMessage(chatId, cancelled ? "تم إلغاء آخر عملية نشطة." : "لا توجد عملية قابلة للإلغاء.", { replyMarkup: keyboardFor(true) });
     return true;
   }
-  if (text === "📦 تحميل نسخة المشروع") {
-    let archive: Awaited<ReturnType<typeof createProjectArchive>> | undefined;
-    await sendMessage(chatId, "📦 جارٍ تجهيز نسخة المشروع الآمنة. لا تتضمن هذه النسخة أي توكن أو سر أو ملف مؤقت…", { replyMarkup: OWNER_KEYBOARD });
-    try {
-      archive = await createProjectArchive();
-      await sendProjectArchive(chatId, archive.archivePath, `📦 <b>نسخة مشروع البوت</b>\nالحجم: <b>${Math.round(archive.bytes / 1024)} KB</b>\nلا تتضمن النسخة الأسرار أو ملفات الوسائط المؤقتة.`);
-    } catch (error) {
-      await sendMessage(chatId, `تعذر إنشاء النسخة: <b>${escapeHtml(error instanceof Error ? error.message : "خطأ غير متوقع")}</b>`, { replyMarkup: OWNER_KEYBOARD });
-    } finally {
-      if (archive) await purgeProjectArchive(archive.workdir);
-    }
-    return true;
-  }
-  const inputs: Record<string, { action: "ban" | "unban" | "limit" | "cleanup" | "broadcast" | "addOwner" | "removeOwner"; prompt: string }> = {
-    "🚫 حظر مستخدم": { action: "ban", prompt: "أرسل الآن رقم المستخدم أو @username لحظره." },
-    "✅ فك الحظر": { action: "unban", prompt: "أرسل الآن رقم المستخدم أو @username لفك الحظر." },
-    "⚙️ سعة البوت": { action: "limit", prompt: "أرسل العدد الجديد للسعة، مثل: 100" },
-    "⏱️ مدة التنظيف": { action: "cleanup", prompt: "أرسل عدد الأيام قبل تنظيف غير النشطين، من 7 إلى 365." },
-    "📣 إرسال للجميع": { action: "broadcast", prompt: "أرسل الآن نص الرسالة. ستصل للمستخدمين النشطين فقط." },
-    "➕ إضافة مالك": { action: "addOwner", prompt: "أرسل المعرّف الرقمي للمالك الذي سيستلم التنبيهات." },
-    "➖ حذف مالك": { action: "removeOwner", prompt: "أرسل المعرّف الرقمي للمالك المراد حذفه من قائمة التنبيهات." },
+  const inputs: Record<string, { action: "ban" | "unban" | "cleanup" | "broadcast" | "addChannel" | "removeChannel" }> = {
+    "🚫 حظر مستخدم": { action: "ban" },
+    "✅ فك الحظر": { action: "unban" },
+    "⏱️ مدة التنظيف": { action: "cleanup" },
+    "📣 إرسال للجميع": { action: "broadcast" },
+    "➕ إضافة قناة/بوت": { action: "addChannel" },
+    "➖ إزالة قناة/بوت": { action: "removeChannel" },
   };
   if (inputs[text]) {
     beginAdminInput(telegramId, inputs[text].action);
-    await sendMessage(chatId, `✍️ ${inputs[text].prompt}\nيمكنك الإلغاء بزر «إلغاء الإدخال».`, { replyMarkup: OWNER_KEYBOARD });
+    await sendMessage(chatId, `✍️ ${pendingInputPrompt(inputs[text].action)}\nيمكنك اختيار زر أداري آخر لإلغاء هذا الإدخال.`, { replyMarkup });
     return true;
   }
   if (text === "↩️ إلغاء الإدخال") {
     pendingAdminInputs.delete(telegramId);
-    await sendMessage(chatId, "تم إلغاء الإدخال الحالي.", { replyMarkup: OWNER_KEYBOARD });
+    await sendMessage(chatId, "تم إلغاء الإدخال الحالي.", { replyMarkup });
     return true;
   }
   return false;
@@ -279,46 +374,48 @@ async function handlePendingAdminInput(message: TelegramMessage, text: string) {
   if (!pending) return false;
   if (pending.expiresAt < Date.now()) {
     pendingAdminInputs.delete(telegramId);
-    await sendMessage(String(message.chat.id), "انتهت مهلة الإدخال. اختر الزر المطلوب مجدداً.", { replyMarkup: OWNER_KEYBOARD });
+    await sendMessage(String(message.chat.id), "انتهت مهلة الإدخال. اختر الزر المطلوب مجدداً.", { replyMarkup: ownerKeyboardFor(telegramId) });
     return true;
   }
   const chatId = String(message.chat.id);
-  const { activeRecipients, addOwner, removeOwner, setTelegramUserBlocked, updateCleanupInactiveDays, updateMaxUsers } = await import("./botDb");
+  const replyMarkup = ownerKeyboardFor(telegramId);
+  const { activeRecipients, setTelegramUserBlocked, updateCleanupInactiveDays } = await import("./botDb");
   try {
     if (pending.action === "ban" || pending.action === "unban") {
       const user = await setTelegramUserBlocked(text, pending.action === "ban");
       if (!user) throw new Error("لم يتم العثور على المستخدم بهذا المعرف أو الاسم.");
       await notifyOwners(`${pending.action === "ban" ? "🚫" : "✅"} <b>تعديل حالة مستخدم</b>\nالمستخدم: <code>${user.telegramId}</code>\nبواسطة المالك: <code>${telegramId}</code>`);
-      await sendMessage(chatId, `تم ${pending.action === "ban" ? "حظر" : "فك حظر"} المستخدم بنجاح.`, { replyMarkup: OWNER_KEYBOARD });
-    } else if (pending.action === "limit") {
-      const value = Number(text);
-      await updateMaxUsers(value);
-      await sendMessage(chatId, `تم ضبط السعة إلى <b>${value}</b> مستخدم.`, { replyMarkup: OWNER_KEYBOARD });
+      await sendMessage(chatId, `تم ${pending.action === "ban" ? "حظر" : "فك حظر"} المستخدم بنجاح.`, { replyMarkup });
     } else if (pending.action === "cleanup") {
       const value = Number(text);
       await updateCleanupInactiveDays(value);
-      await sendMessage(chatId, `تم ضبط التنظيف بعد <b>${value}</b> يوماً من عدم النشاط.`, { replyMarkup: OWNER_KEYBOARD });
-    } else if (pending.action === "addOwner" || pending.action === "removeOwner") {
-      if (!/^\d+$/.test(text.trim())) throw new Error("أدخل معرف تلغرام رقمي صحيح.");
-      const changed = pending.action === "addOwner" ? await addOwner(text.trim(), telegramId) : await removeOwner(text.trim());
-      if (!changed) throw new Error("لم يتغير شيء. تحقق من المعرّف.");
-      await notifyOwners(`👑 <b>تعديل قائمة الملاك</b>\nالإجراء: ${pending.action === "addOwner" ? "إضافة" : "حذف"}\nالمعرّف: <code>${escapeHtml(text.trim())}</code>`);
-      await sendMessage(chatId, "تم تعديل قائمة الملاك بنجاح.", { replyMarkup: OWNER_KEYBOARD });
+      await sendMessage(chatId, `تم ضبط التنظيف بعد <b>${value}</b> يوماً من عدم النشاط.`, { replyMarkup });
+    } else if (pending.action === "addChannel") {
+      const parsed = parseSubscriptionTarget(text);
+      const added = await addForcedSubscription({ target: parsed.target, inviteUrl: parsed.inviteUrl, label: parsed.label, kind: parsed.kind });
+      if (!added) throw new Error("هذه القناة/البوت مضاف بالفعل.");
+      await notifyOwners(`🔒 <b>إضافة اشتراك إجباري</b>\nالنوع: <b>${parsed.kind}</b>\nالمعرّف: <code>${escapeHtml(parsed.target)}</code>\nالرابط: <code>${escapeHtml(parsed.inviteUrl || "—")}</code>`);
+      await sendMessage(chatId, `✅ تمت إضافة «<b>${escapeHtml(parsed.label)}</b>» إلى الاشتراك الإجباري.\nسيُطلب من المستخدمين الانضمام قبل استخدام البوت.`, { replyMarkup });
+    } else if (pending.action === "removeChannel") {
+      const removed = await removeForcedSubscription(text);
+      if (!removed) throw new Error("لم يتم العثور على هذا الاشتراك. تحقق من المعرّف.");
+      await notifyOwners(`🔓 <b>إزالة اشتراك إجباري</b>\nالمعرّف: <code>${escapeHtml(text.trim())}</code>`);
+      await sendMessage(chatId, "✅ تمت إزالة الاشتراك بنجاح.", { replyMarkup });
     } else {
       const content = text.trim();
       if (!content || content.length > 3500) throw new Error("اكتب رسالة بين 1 و3500 حرفاً.");
       const recipients = await activeRecipients();
-      await sendMessage(chatId, `📣 بدأ الإرسال إلى <b>${recipients.length}</b> مستخدماً نشطاً…`, { replyMarkup: OWNER_KEYBOARD });
+      await sendMessage(chatId, `📣 بدأ الإرسال إلى <b>${recipients.length}</b> مستخدماً نشطاً…`, { replyMarkup });
       let success = 0; let failed = 0;
       for (let index = 0; index < recipients.length; index += 20) {
         const result = await Promise.allSettled(recipients.slice(index, index + 20).map(user => sendMessage(user.telegramId, escapeHtml(content))));
         result.forEach(entry => entry.status === "fulfilled" ? success += 1 : failed += 1);
         if (index + 20 < recipients.length) await new Promise(resolve => setTimeout(resolve, 1_000));
       }
-      await sendMessage(chatId, `تم الإرسال.\nالناجح: <b>${success}</b>\nالمتعذر: <b>${failed}</b>`, { replyMarkup: OWNER_KEYBOARD });
+      await sendMessage(chatId, `تم الإرسال.\nالناجح: <b>${success}</b>\nالمتعذر: <b>${failed}</b>`, { replyMarkup });
     }
   } catch (error) {
-    await sendMessage(chatId, `تعذر التنفيذ: <b>${escapeHtml(error instanceof Error ? error.message : "خطأ غير متوقع")}</b>`, { replyMarkup: OWNER_KEYBOARD });
+    await sendMessage(chatId, `تعذر التنفيذ: <b>${escapeHtml(error instanceof Error ? error.message : "خطأ غير متوقع")}</b>`, { replyMarkup });
   } finally {
     pendingAdminInputs.delete(telegramId);
   }
@@ -332,10 +429,19 @@ async function handleMessage(message: TelegramMessage) {
   const chatId = String(message.chat.id);
   const telegramId = String(message.from!.id);
 
+  const role = await getOwnerRole(telegramId);
+  if (!role && !admission.primary) {
+    const missing = await checkForcedSubscriptions(telegramId);
+    if (missing.length) {
+      await sendMessage(chatId, subscriptionGateText(missing), { replyMarkup: subscriptionGateKeyboard(missing) });
+      return;
+    }
+  }
+
   if (admission.primary) {
     if (text === "/admin") {
       pendingAdminInputs.delete(telegramId);
-      return sendAdminPanel(chatId);
+      return sendAdminPanel(chatId, telegramId);
     }
     if (isOwnerControlLabel(text)) {
       pendingAdminInputs.delete(telegramId);
@@ -344,7 +450,15 @@ async function handleMessage(message: TelegramMessage) {
     if (await handlePendingAdminInput(message, text)) return;
   }
 
-  if (text === "/start") return sendMessage(chatId, welcomeText(userName(message)), { replyMarkup: keyboardFor(admission.primary) });
+  if (text === "/start" || text === "🚀 تشغيل البوت" || /^\/start@/i.test(text)) {
+    pendingAdminInputs.delete(telegramId);
+    pendingReports.delete(telegramId);
+    const info: WelcomeUserInfo = { username: message.from?.username, language: message.from?.language_code };
+    const user = await getTelegramUser(telegramId);
+    if (user?.firstSeenAt) info.firstSeen = user.firstSeenAt;
+    await sendWelcomePhoto(chatId).catch(() => undefined);
+    return sendMessage(chatId, welcomeText(userName(message), info), { replyMarkup: keyboardFor(admission.primary) });
+  }
   if (text === "/help" || text === "❔ طريقة الاستخدام") return sendMessage(chatId, HELP_TEXT, { replyMarkup: keyboardFor(admission.primary) });
   if (text === "📩 إرسال بلاغ") {
     pendingReports.set(telegramId, Date.now() + 10 * 60_000);
@@ -375,6 +489,13 @@ async function handleDownloadCallback(callback: TelegramCallbackQuery) {
   const data = callback.data || "";
   const senderId = String(callback.from.id);
   const primary = await isPrimaryOwner(senderId);
+  if (data === "sub_check") {
+    if (!allowCallback(senderId)) return answerCallbackQuery(callback.id, "💡 أنت تضغط بسرعة. انتظر قليلاً ثم أعد المحاولة.");
+    const missing = await checkForcedSubscriptions(senderId);
+    if (missing.length) return answerCallbackQuery(callback.id, "ما زلت غير مشترك في كل القنوات المطلوبة");
+    await answerCallbackQuery(callback.id, "تم التحقق من الاشتراك ✅");
+    return sendMessage(chatId, "✅ <b>تم التحقق من الاشتراك بنجاح</b>\nاضغط «🚀 تشغيل البوت» ثم أرسل رابط المنشور للبدء.", { replyMarkup: keyboardFor(primary) });
+  }
   if (data.startsWith("cancel:")) {
     const cancelJob = await getMediaJob(data.slice(7));
     const cancelled = await cancelMediaJob(data.slice(7), senderId);
@@ -400,15 +521,18 @@ async function handleDownloadCallback(callback: TelegramCallbackQuery) {
     }, retryJob.sourceUrl, primary);
     return;
   }
-  const [, jobId, rawChoice] = data.split(":");
-  if (!jobId || !["video", "audio", "image", "story"].includes(rawChoice)) return answerCallbackQuery(callback.id, "طلب غير صالح");
+  const parts = data.split(":");
+  const jobId = parts[1];
+  const rawChoice = parts[2];
+  const allImages = rawChoice === "images";
+  const choice: MediaChoice = allImages ? "image" : (rawChoice as MediaChoice);
+  if (!jobId || !["video", "audio", "image", "story"].includes(choice)) return answerCallbackQuery(callback.id, "طلب غير صالح");
   if (!allowCallback(senderId)) return answerCallbackQuery(callback.id, "💡 أنت تضغط بسرعة. انتظر قليلاً ثم أعد المحاولة.");
-  const choice = rawChoice as MediaChoice;
   const job = await getMediaJob(jobId);
   if (!job || job.telegramId !== senderId || job.status !== "ready" || job.cancelRequested) return answerCallbackQuery(callback.id, "انتهت صلاحية هذا الطلب");
-  await answerCallbackQuery(callback.id, "بدأ تجهيز الملف");
+  await answerCallbackQuery(callback.id, allImages ? "بدأ تجهيز الصور" : "بدأ تجهيز الملف");
   await updateMediaJob(jobId, { status: "downloading", selectedChoice: choice });
-  const action: "upload_video" | "upload_audio" | "upload_photo" = choice === "video" || choice === "story" ? "upload_video" : choice === "audio" ? "upload_audio" : "upload_photo";
+  const action: "upload_video" | "upload_audio" | "upload_photo" = allImages || choice === "image" ? "upload_photo" : choice === "audio" ? "upload_audio" : "upload_video";
   let workdir: string | undefined;
   let preserveRetryJob = false;
   let deleteJobOnFinish = true;
@@ -417,6 +541,7 @@ async function handleDownloadCallback(callback: TelegramCallbackQuery) {
       const beforeDownload = await getMediaJob(jobId);
       if (!beforeDownload || beforeDownload.cancelRequested) throw new DownloaderError("تم إلغاء العملية بنجاح.");
       await sendChatAction(chatId, action).catch(() => undefined);
+      if (allImages) return downloadAllImages(job.sourceUrl, jobId);
       return downloadMedia(job.sourceUrl, choice, jobId);
     });
     const queueMessage = queued.position > 1
@@ -428,9 +553,15 @@ async function handleDownloadCallback(callback: TelegramCallbackQuery) {
     const latest = await getMediaJob(jobId);
     if (!latest || latest.cancelRequested) return;
     await sendChatAction(chatId, action).catch(() => undefined);
-    await sendDownloadedMedia(chatId, choice, output.filePath, "✅ <b>اكتمل التنزيل</b> — الملف أُرسل بنجاح وسيُحذف من الخادم الآن.");
+    if (allImages) {
+      const files = (output as { files: Array<{ path: string }> }).files;
+      const caption = `✅ <b>اكتمل تنزيل الصور</b>\nعدد الصور: <b>${files.length}</b>\nسيُحذف الملف من الخادم الآن.`;
+      await sendMediaGroup(chatId, files.map(file => ({ path: file.path, caption })));
+    } else {
+      await sendDownloadedMedia(chatId, choice, (output as { filePath: string }).filePath, "✅ <b>اكتمل التنزيل</b> — الملف أُرسل بنجاح وسيُحذف من الخادم الآن.");
+    }
     await updateMediaJob(jobId, { status: "sent" });
-    await notifyOwners(`✅ <b>تنزيل مكتمل</b>\nالمستخدم: <code>${senderId}</code>\nالنوع: <b>${mediaLabel(choice)}</b>\nالحجم: <b>${Math.round(output.bytes / 1024)} KB</b>\nالرابط: <code>${escapeHtml(job.sourceUrl.slice(0, 500))}</code>`);
+    await notifyOwners(`✅ <b>تنزيل مكتمل</b>\nالمستخدم: <code>${senderId}</code>\nالنوع: <b>${allImages ? "صور كاملة" : mediaLabel(choice)}</b>\nالحجم: <b>${Math.round(output.bytes / 1024)} KB</b>\nالرابط: <code>${escapeHtml(job.sourceUrl.slice(0, 500))}</code>`);
   } catch (error) {
     if (error instanceof DownloaderError && error.message === "تم إلغاء العملية بنجاح.") return;
     if (error instanceof DownloadQueueError) {
@@ -446,7 +577,7 @@ async function handleDownloadCallback(callback: TelegramCallbackQuery) {
     const retryMarkup = preserveRetryJob ? retryTikTokKeyboard(jobId) : keyboardFor(primary);
     const retryHint = preserveRetryJob ? "\n\nيمكنك الضغط على «إعادة محاولة TikTok» لإعادة الفحص تلقائياً." : "";
     await sendMessage(chatId, `تعذر إكمال التنزيل.\n<b>${escapeHtml(userFacingMediaError(error))}</b>${retryHint}`, { replyMarkup: retryMarkup });
-    await notifyError({ telegramId: senderId, sourceUrl: job.sourceUrl, stage: "تنزيل وإرسال", error, mediaChoice: choice });
+    await notifyError({ telegramId: senderId, sourceUrl: job.sourceUrl, stage: "تنزيل وإرسال", error, mediaChoice: allImages ? "image" : choice });
   } finally {
     if (workdir) await purgeDownloadedMedia(workdir);
     if (!preserveRetryJob && deleteJobOnFinish) await deleteMediaJob(jobId);

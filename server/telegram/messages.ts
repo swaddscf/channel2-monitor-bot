@@ -1,4 +1,4 @@
-import type { InspectResult } from "./types";
+import type { ForcedSubscription, InspectResult } from "./types";
 import { countryLabel, formatCount } from "./tiktokProfile";
 
 export type ButtonStyle = "primary" | "success" | "danger";
@@ -7,21 +7,50 @@ export function escapeHtml(value: string) {
   return value.replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" })[char] || char);
 }
 
-export function welcomeText(name: string) {
-  return `✦ أهلاً <b>${escapeHtml(name)}</b>
+export type WelcomeUserInfo = {
+  username?: string;
+  language?: string;
+  firstSeen?: Date;
+};
 
-أنا بوت تنزيل الوسائط العامة. أرسل رابطاً واحداً وسأعرض الخيارات المتاحة: <b>فيديو</b> أو <b>صوت</b> أو <b>صورة أصلية</b> أو <b>ستوري</b>.
+function languageLabel(code?: string) {
+  if (!code) return undefined;
+  const normalized = code.toLowerCase();
+  const labels: Record<string, string> = {
+    ar: "العربية", en: "الإنجليزية", fr: "الفرنسية", es: "الإسبانية", de: "الألمانية",
+    ru: "الروسية", tr: "التركية", fa: "الفارسية", ur: "الأردية", hi: "الهندية",
+    id: "الإندونيسية", pt: "البرتغالية", it: "الإيطالية", nl: "الهولندية", zh: "الصينية",
+    ja: "اليابانية", ko: "الكورية", pl: "البولندية", uk: "الأوكرانية", vi: "الفيتنامية",
+  };
+  return labels[normalized] || normalized;
+}
+
+function userCard(info?: WelcomeUserInfo) {
+  if (!info) return "";
+  const lines = ["🧾 <b>بيانات ملفك</b>"];
+  if (info.username) lines.push(`المعرف: @${escapeHtml(info.username)}`);
+  const language = languageLabel(info.language);
+  if (language) lines.push(`اللغة: ${escapeHtml(language)}`);
+  if (info.firstSeen) lines.push(`أول استخدام: ${info.firstSeen.toLocaleDateString("ar-EG", { day: "numeric", month: "long", year: "numeric" })}`);
+  return `\n\n${lines.join("\n")}`;
+}
+
+export function welcomeText(name: string, info?: WelcomeUserInfo) {
+  return `✦ <b>أهلاً بك يا ${escapeHtml(name)}</b> 🎬
+
+أنا بوت تحميل الوسائط العامة. أرسل رابطاً واحداً وسأعرض لك ما يمكن تنزيله من: <b>فيديو</b> • <b>صوت</b> • <b>الصور كاملة</b> • <b>ستوري</b>.
+${userCard(info)}
 
 <b>المنصات المدعومة</b>
 TikTok • Instagram • Facebook • Snapchat • Pinterest • Twitter/X
 
 <b>على TikTok أعرض لك أيضاً بطاقة الحساب</b>
-الاسم، اسم المستخدم، المتابعين، المنشورات، والدولة — بشكل حقيقي من بيانات الحساب العام.
+الاسم، اسم المستخدم، المتابعين، المنشورات، والدولة — من البيانات العامة للحساب، مع عدد صور المشاركة إذا كانت متعددة.
 
 <b>بثلاث خطوات</b>
 ① انسخ رابط المنشور أو الفيديو أو القصة العامة.
 ② أرسله هنا كما هو، من دون إضافة نص آخر.
-③ اختر فيديو أو صوتاً أو صورة أو ستوري عندما يؤكد المصدر توافرها.
+③ انقر نوع الملف الذي تريد تنزيله عندما يؤكد المصدر توفره.
 
 لا أقبل الحسابات الخاصة أو المحتوى المحمي. استخدم الروابط العامة التي تملك حق تنزيلها فقط.`;
 }
@@ -30,13 +59,11 @@ export const HELP_TEXT = `❔ <b>كيف أستخدم البوت؟</b>
 
 أرسل رابطاً عاماً واحداً فقط. يدعم البوت TikTok وInstagram وFacebook وSnapchat وPinterest وTwitter/X. في Twitter/X استخدم رابط المنشور بصيغة <code>https://x.com/اسم_المستخدم/status/123</code>، وليس رابط الحساب.
 
-بعد الفحص ستظهر الأزرار المناسبة: فيديو أو صوت أو صورة أصلية أو ستوري. لا يظهر الخيار إلا عندما يؤكد المصدر وجوده. قصص Instagram وFacebook وSnapchat تظهر عبر زر <b>تنزيل الستوري</b> إذا كان الرابط عاماً وما زال المصدر يتيحه.
+بعد الفحص تظهر الأزرار المناسبة: فيديو أو صوت أو صورة أصلية أو ستوري. المشاركات المتعددة الصور تعرض عدد الصور وزر <b>تنزيل الصور كاملة</b>.
 
-على روابط TikTok يُعرض أيضاً كشف حساب الناشر عند توفر البيانات: الاسم، اسم المستخدم، عدد المتابعين والمنشورات والدولة.
+على روابط TikTok يُعرض أيضاً كشف حساب الناشر عند توفر البيانات.
 
-استخدم زر <b>إلغاء العملية</b> لإيقاف الفحص أو التنزيل الحالي. للبلاغات، اضغط <b>إرسال بلاغ</b> وأرسل الرابط مع السبب.
-
-قد يرفض المصدر الرابط الخاص أو المحمي أو الملف الكبير أو يحجب طلبات الخادم مؤقتاً؛ عندها ستصلك رسالة واضحة ويمكنك تجربة رابط عام آخر.`;
+استخدم زر <b>إلغاء العملية</b> لإيقاف الفحص أو التنزيل الحالي. للبلاغات، اضغط <b>إرسال بلاغ</b>.`;
 
 export const REPORT_TEXT = `لإرسال بلاغ، اكتب الرسالة بهذا الشكل:
 <code>/report الرابط أو المعرّف | السبب</code>
@@ -70,31 +97,99 @@ function inlineButton(text: string, callbackData: string, style: ButtonStyle, ic
 
 export const USER_KEYBOARD = {
   keyboard: [
-    [replyButton("❔ طريقة الاستخدام", "primary"), replyButton("🛑 إلغاء العملية", "danger")],
-    [replyButton("📩 إرسال بلاغ", "primary")],
-  ],
-  resize_keyboard: true,
-  is_persistent: true,
-};
-
-export const OWNER_KEYBOARD = {
-  keyboard: [
-    [replyButton("📊 الإحصاءات", "success"), replyButton("👥 آخر المستخدمين", "primary")],
-    [replyButton("✅ النشطون", "primary"), replyButton("🌙 غير النشطين", "primary"), replyButton("🚫 المحظورون", "primary")],
-    [replyButton("🚫 حظر مستخدم", "danger"), replyButton("✅ فك الحظر", "success")],
-    [replyButton("📣 إرسال للجميع", "primary"), replyButton("⚙️ سعة البوت", "primary")],
-    [replyButton("🧹 تنظيف الآن", "danger"), replyButton("⏱️ مدة التنظيف", "primary")],
-    [replyButton("👑 الملاك", "primary"), replyButton("➕ إضافة مالك", "success"), replyButton("➖ حذف مالك", "danger")],
-    [replyButton("📦 تحميل نسخة المشروع", "success")],
-    [replyButton("📋 أخطاء حديثة", "primary"), replyButton("↩️ إلغاء الإدخال", "primary")],
+    [replyButton("🚀 تشغيل البوت", "success")],
+    [replyButton("❔ طريقة الاستخدام", "primary"), replyButton("📩 إرسال بلاغ", "primary")],
     [replyButton("🛑 إلغاء العملية", "danger")],
   ],
   resize_keyboard: true,
   is_persistent: true,
 };
 
+const OWNER_FOOTER = [
+  [replyButton("↩️ رجوع", "primary"), replyButton("🏠 الرئيسية", "primary")],
+];
+
+export const OWNER_KEYBOARD = {
+  keyboard: [
+    [replyButton("🚀 تشغيل البوت", "success")],
+    [replyButton("📊 الإحصاءات", "success"), replyButton("👥 إدارة المستخدمين", "primary")],
+    [replyButton("🔒 الاشتراك الإجباري", "primary"), replyButton("⚙️ الإعدادات", "primary")],
+    [replyButton("🧹 تنظيف البيانات", "danger"), replyButton("📣 إرسال للجميع", "primary")],
+    [replyButton("📋 أخطاء حديثة", "primary"), replyButton("🛑 إلغاء العملية", "danger")],
+  ],
+  resize_keyboard: true,
+  is_persistent: true,
+};
+
+export const OWNER_USERS_KEYBOARD = {
+  keyboard: [
+    [replyButton("👥 آخر المستخدمين", "primary"), replyButton("✅ النشطون", "primary")],
+    [replyButton("🌙 غير النشطين", "primary"), replyButton("🚫 المحظورون", "primary")],
+    [replyButton("🚫 حظر مستخدم", "danger"), replyButton("✅ فك الحظر", "success")],
+    ...OWNER_FOOTER,
+  ],
+  resize_keyboard: true,
+  is_persistent: true,
+};
+
+export const OWNER_SETTINGS_KEYBOARD = {
+  keyboard: [
+    [replyButton("⏱️ مدة التنظيف", "primary")],
+    ...OWNER_FOOTER,
+  ],
+  resize_keyboard: true,
+  is_persistent: true,
+};
+
+export const OWNER_CLEANUP_KEYBOARD = {
+  keyboard: [
+    [replyButton("🧹 تنظيف الآن", "danger"), replyButton("⏱️ مدة التنظيف", "primary")],
+    ...OWNER_FOOTER,
+  ],
+  resize_keyboard: true,
+  is_persistent: true,
+};
+
+export const OWNER_SUBSCRIPTIONS_KEYBOARD = {
+  keyboard: [
+    [replyButton("➕ إضافة قناة/بوت", "success"), replyButton("➖ إزالة قناة/بوت", "danger")],
+    [replyButton("📋 قائمة الاشتراك", "primary")],
+    ...OWNER_FOOTER,
+  ],
+  resize_keyboard: true,
+  is_persistent: true,
+};
+
+export function subscriptionGateText(missing: ForcedSubscription[]) {
+  const items = missing.map((subscription, index) => {
+    const kindLabel = subscription.kind === "group" ? "مجموعة" : subscription.kind === "bot" ? "بوت" : "قناة";
+    const link = subscription.inviteUrl ? ` <a href="${escapeHtml(subscription.inviteUrl)}">@${escapeHtml(subscription.label.replace(/^@/, ""))}</a>` : ` <code>${escapeHtml(subscription.label)}</code>`;
+    return `${index + 1}. (${kindLabel})${link}`;
+  }).join("\n");
+  return `🔒 <b>اشتراك إجباري</b>
+
+للحصول على خدمة التنزيل يجب الاشتراك أولاً في:
+
+${items}
+
+اضغط زر الاشتراك ثم زر <b>«تحققت من الاشتراك»</b>.`;
+}
+
+export function subscriptionGateKeyboard(missing: ForcedSubscription[]) {
+  const joinRows = missing
+    .filter(subscription => Boolean(subscription.inviteUrl))
+    .map(subscription => [{ text: `🔗 اشترك الآن · ${subscription.label}`, url: subscription.inviteUrl }]);
+  return {
+    inline_keyboard: [
+      ...joinRows,
+      [inlineButton("✅ تحققت من الاشتراك", "sub_check", "primary")],
+    ],
+  };
+}
+
 export function inspectionText(result: InspectResult) {
   const duration = result.durationSeconds ? `\nالمدة التقريبية: <b>${Math.round(result.durationSeconds)} ثانية</b>` : "";
+  const imagesCount = result.imageCount && result.imageCount > 1 ? `\n🖼 عدد الصور المتاحة: <b>${result.imageCount}</b>` : "";
   const platformLabels: Record<InspectResult["platform"], string> = {
     tiktok: "TikTok",
     instagram: "Instagram",
@@ -128,7 +223,7 @@ export function inspectionText(result: InspectResult) {
   return `✦ <b>تم فحص الرابط</b>
 
 المنصة: <b>${platformLabels[result.platform]}</b>
-العنوان: <b>${escapeHtml(result.title)}</b>${duration}${accountBlock}
+العنوان: <b>${escapeHtml(result.title)}</b>${duration}${imagesCount}${accountBlock}
 
 اختر نوع الملف المناسب. لا يُعرض إلا ما أكده الفحص من هذا الرابط العام.`;
 }
@@ -140,13 +235,13 @@ const MEDIA_BUTTONS: Record<InspectResult["choices"][number], { text: string; st
   story: { text: "📖 تنزيل الستوري", style: "success", iconEnv: "BUTTON_CUSTOM_EMOJI_STORY" },
 };
 
-export function mediaChoiceKeyboard(jobId: string, choices: InspectResult["choices"]) {
-  return {
-    inline_keyboard: [
-      ...choices.map(choice => [inlineButton(MEDIA_BUTTONS[choice].text, `dl:${jobId}:${choice}`, MEDIA_BUTTONS[choice].style, MEDIA_BUTTONS[choice].iconEnv)]),
-      [inlineButton("✖️ إلغاء العملية", `cancel:${jobId}`, "danger", "BUTTON_CUSTOM_EMOJI_CANCEL")],
-    ],
-  };
+export function mediaChoiceKeyboard(jobId: string, choices: InspectResult["choices"], imageCount?: number) {
+  const rows = choices.map(choice => [inlineButton(MEDIA_BUTTONS[choice].text, `dl:${jobId}:${choice}`, MEDIA_BUTTONS[choice].style, MEDIA_BUTTONS[choice].iconEnv)]);
+  if (imageCount && imageCount > 1 && choices.includes("image")) {
+    rows.push([inlineButton(`🖼 تنزيل الصور كاملة (${imageCount})`, `dl:${jobId}:images`, "success", "BUTTON_CUSTOM_EMOJI_IMAGE")]);
+  }
+  rows.push([inlineButton("✖️ إلغاء العملية", `cancel:${jobId}`, "danger", "BUTTON_CUSTOM_EMOJI_CANCEL")]);
+  return { inline_keyboard: rows };
 }
 
 export function retryTikTokKeyboard(jobId: string) {

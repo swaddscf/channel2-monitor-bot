@@ -9,12 +9,6 @@ var __export = (target, all) => {
 };
 
 // server/telegram/policy.ts
-function canAdmitNewUser(activeUserCount, maxUsers, role) {
-  return Boolean(role) || activeUserCount < maxUsers;
-}
-function isValidMaxUsers(value) {
-  return Number.isInteger(value) && value >= 1 && value <= 1e6;
-}
 function isValidCleanupDays(value) {
   return Number.isInteger(value) && value >= 7 && value <= 365;
 }
@@ -34,6 +28,7 @@ var init_policy = __esm({
 var botDb_exports = {};
 __export(botDb_exports, {
   activeRecipients: () => activeRecipients,
+  addForcedSubscription: () => addForcedSubscription,
   addOwner: () => addOwner,
   botStats: () => botStats,
   cancelLatestActiveJob: () => cancelLatestActiveJob,
@@ -45,26 +40,68 @@ __export(botDb_exports, {
   deleteMediaJob: () => deleteMediaJob,
   ensureBotSettings: () => ensureBotSettings,
   ensurePrimaryOwner: () => ensurePrimaryOwner,
+  findForcedSubscription: () => findForcedSubscription,
   findTelegramUser: () => findTelegramUser,
   getMediaJob: () => getMediaJob,
   getOwnerRole: () => getOwnerRole,
+  getTelegramUser: () => getTelegramUser,
   isOwner: () => isOwner,
   isPrimaryOwner: () => isPrimaryOwner,
+  listForcedSubscriptions: () => listForcedSubscriptions,
   listOwners: () => listOwners,
   listTelegramUsers: () => listTelegramUsers,
   recentErrors: () => recentErrors,
   recordBotError: () => recordBotError,
+  removeForcedSubscription: () => removeForcedSubscription,
   removeOwner: () => removeOwner,
   resetBotMemoryStore: () => resetBotMemoryStore,
   setTelegramUserBlocked: () => setTelegramUserBlocked,
   touchAndAdmitUser: () => touchAndAdmitUser,
   updateCleanupInactiveDays: () => updateCleanupInactiveDays,
-  updateMaxUsers: () => updateMaxUsers,
   updateMediaJob: () => updateMediaJob
 });
 import { nanoid } from "nanoid";
+import { mkdir, readFile as readFile2, writeFile } from "node:fs/promises";
+import path3 from "node:path";
 function configuredPrimaryOwnerId() {
   return (process.env.OWNER_ID || "").trim();
+}
+function subscriptionsFile() {
+  const dir = process.env.DATA_DIR?.trim() || path3.join(process.cwd(), "data");
+  return path3.join(dir, "subscriptions.json");
+}
+async function loadSubscriptionsFromDisk() {
+  try {
+    const raw = await readFile2(subscriptionsFile(), "utf8");
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      store.subscriptions.clear();
+      parsed.forEach((subscription) => store.subscriptions.set(subscription.id, { ...subscription, createdAt: new Date(subscription.createdAt) }));
+    }
+  } catch {
+    try {
+      await mkdir(path3.dirname(subscriptionsFile()), { recursive: true });
+      await saveSubscriptionsToDisk();
+    } catch {
+    }
+  }
+}
+function saveSubscriptionsToDisk() {
+  subscriptionsWriteChain = subscriptionsWriteChain.then(async () => {
+    const data = JSON.stringify(Array.from(store.subscriptions.values()), null, 2);
+    try {
+      await mkdir(path3.dirname(subscriptionsFile()), { recursive: true });
+      await writeFile(subscriptionsFile(), data, "utf8");
+    } catch {
+    }
+  });
+  return subscriptionsWriteChain.catch(() => void 0);
+}
+function ensureSubscriptionsLoaded() {
+  if (!subscriptionsPersistenceReady) {
+    subscriptionsPersistenceReady = loadSubscriptionsFromDisk();
+  }
+  return subscriptionsPersistenceReady;
 }
 function cloneSetting() {
   return { ...store.settings };
@@ -75,9 +112,11 @@ function resetBotMemoryStore() {
   store.owners.clear();
   store.jobs.clear();
   store.errors = [];
+  store.subscriptions.clear();
   store.processedUpdateIds.clear();
   store.nextUserId = 1;
   store.nextErrorId = 1;
+  subscriptionsPersistenceReady = void 0;
 }
 async function ensureBotSettings() {
   ensurePrimaryOwner();
@@ -120,9 +159,6 @@ async function touchAndAdmitUser(from) {
     });
     return { admission: "active", isNew: false };
   }
-  const role = store.owners.get(telegramId)?.role;
-  const total = Array.from(store.users.values()).filter((user) => user.status === "active").length;
-  if (!canAdmitNewUser(total, store.settings.maxUsers, role)) return { admission: "capacity", isNew: true };
   store.users.set(telegramId, {
     id: store.nextUserId++,
     telegramId,
@@ -211,6 +247,9 @@ async function listTelegramUsers(kind, limit = 50) {
   const sorted = filtered.sort((a, b) => kind === "recent" ? b.firstSeenAt.getTime() - a.firstSeenAt.getTime() : b.lastSeenAt.getTime() - a.lastSeenAt.getTime());
   return sorted.slice(0, limit);
 }
+async function getTelegramUser(telegramId) {
+  return store.users.get(String(telegramId));
+}
 async function findTelegramUser(identifier) {
   const normalized = identifier.trim().replace(/^@/, "");
   if (/^\d+$/.test(normalized)) {
@@ -257,10 +296,6 @@ async function removeOwner(telegramId) {
   store.owners.delete(telegramId);
   return true;
 }
-async function updateMaxUsers(maxUsers) {
-  if (!isValidMaxUsers(maxUsers)) throw new Error("\u0627\u0644\u062D\u062F \u064A\u062C\u0628 \u0623\u0646 \u064A\u0643\u0648\u0646 \u0639\u062F\u062F\u0627\u064B \u0635\u062D\u064A\u062D\u0627\u064B \u0628\u064A\u0646 1 \u06481,000,000.");
-  store.settings = { ...store.settings, maxUsers, updatedAt: /* @__PURE__ */ new Date() };
-}
 async function updateCleanupInactiveDays(days) {
   if (!isValidCleanupDays(days)) throw new Error("\u0645\u062F\u0629 \u0627\u0644\u062A\u0646\u0638\u064A\u0641 \u064A\u062C\u0628 \u0623\u0646 \u062A\u0643\u0648\u0646 \u0628\u064A\u0646 7 \u0648365 \u064A\u0648\u0645\u0627\u064B.");
   store.settings = { ...store.settings, cleanupInactiveDays: days, updatedAt: /* @__PURE__ */ new Date() };
@@ -291,6 +326,39 @@ async function cleanupBotData() {
 async function activeRecipients() {
   return Array.from(store.users.values()).filter((user) => user.status === "active").map((user) => ({ telegramId: user.telegramId }));
 }
+async function listForcedSubscriptions() {
+  await ensureSubscriptionsLoaded();
+  return Array.from(store.subscriptions.values()).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+}
+async function addForcedSubscription(input) {
+  await ensureSubscriptionsLoaded();
+  const normalized = input.target.trim();
+  const existing = Array.from(store.subscriptions.values()).find((subscription2) => subscription2.target === normalized);
+  if (existing) return false;
+  const subscription = {
+    ...input,
+    target: normalized,
+    id: nanoid(12),
+    createdAt: /* @__PURE__ */ new Date()
+  };
+  store.subscriptions.set(subscription.id, subscription);
+  await saveSubscriptionsToDisk();
+  return true;
+}
+async function removeForcedSubscription(identifier) {
+  await ensureSubscriptionsLoaded();
+  const cleaned = identifier.trim().replace(/^https:\/\/t\.me\//, "").replace(/^@/, "");
+  const subscription = Array.from(store.subscriptions.values()).find((candidate) => candidate.id === identifier.trim() || candidate.target === cleaned || candidate.label === identifier.trim());
+  if (!subscription) return false;
+  store.subscriptions.delete(subscription.id);
+  await saveSubscriptionsToDisk();
+  return true;
+}
+async function findForcedSubscription(target) {
+  await ensureSubscriptionsLoaded();
+  const normalized = target.replace(/^@/, "");
+  return Array.from(store.subscriptions.values()).find((subscription) => subscription.target.replace(/^@/, "") === normalized);
+}
 async function cleanupStaleJobs() {
   const now = Date.now();
   store.jobs.forEach((job, id) => {
@@ -299,7 +367,7 @@ async function cleanupStaleJobs() {
     }
   });
 }
-var DEFAULT_SETTINGS, store;
+var DEFAULT_SETTINGS, store, subscriptionsPersistenceReady, subscriptionsWriteChain;
 var init_botDb = __esm({
   "server/telegram/botDb.ts"() {
     "use strict";
@@ -317,10 +385,12 @@ var init_botDb = __esm({
       owners: /* @__PURE__ */ new Map(),
       jobs: /* @__PURE__ */ new Map(),
       errors: [],
+      subscriptions: /* @__PURE__ */ new Map(),
       processedUpdateIds: /* @__PURE__ */ new Set(),
       nextUserId: 1,
       nextErrorId: 1
     };
+    subscriptionsWriteChain = Promise.resolve();
   }
 });
 
@@ -1120,6 +1190,41 @@ function matchesWebhookSecret(expected, supplied) {
   const suppliedValue = Buffer.from(supplied);
   return expectedValue.length === suppliedValue.length && timingSafeEqual(expectedValue, suppliedValue);
 }
+function parseSubscriptionTarget(rawInput) {
+  const input = rawInput.trim();
+  if (!input) throw new PublicLinkError("\u0623\u0631\u0633\u0644 \u0645\u0639\u0631\u0651\u0641 \u0627\u0644\u0642\u0646\u0627\u0629 \u0623\u0648 @username \u0623\u0648 \u0631\u0627\u0628\u0637 t.me.");
+  let target;
+  let inviteUrl;
+  const tmeMatch = input.match(/^(?:https?:\/\/)?(?:www\.)?(?:t|telegram)\.me\/([^\s/?]+)/i);
+  if (tmeMatch) {
+    const rawName = tmeMatch[1].replace(/^@/, "");
+    if (rawName.startsWith("+") || /^joinchat\//.test(rawName)) {
+      throw new PublicLinkError("\u0631\u0648\u0627\u0628\u0637 \u0627\u0644\u062F\u0639\u0648\u0629 \u0627\u0644\u062E\u0627\u0635\u0629 (+...) \u0644\u0627 \u064A\u0645\u0643\u0646 \u0641\u062D\u0635 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643 \u0645\u0646\u0647\u0627. \u0623\u0631\u0633\u0644 @username \u0623\u0648 \u0627\u0644\u0645\u0639\u0631\u0651\u0641 \u0627\u0644\u0631\u0642\u0645\u064A \u0644\u0644\u0642\u0646\u0627\u0629 \u0628\u062F\u0644\u0627\u064B \u0645\u0646\u0647\u0627.");
+    }
+    target = rawName;
+    inviteUrl = `https://t.me/${rawName}`;
+  } else if (input.startsWith("@")) {
+    target = input.slice(1);
+    if (!/^[A-Za-z0-9_]{4,32}$/.test(target)) throw new PublicLinkError("\u0627\u0633\u0645 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645 \u063A\u064A\u0631 \u0635\u0627\u0644\u062D \u062F\u0627\u062E\u0644 Telegram.");
+    inviteUrl = `https://t.me/${target}`;
+  } else if (/^-?\d{6,}$/.test(input)) {
+    target = input;
+    inviteUrl = "";
+  } else {
+    if (!/^[A-Za-z0-9_]{4,32}$/.test(input)) throw new PublicLinkError("\u0627\u0633\u0645 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645 \u063A\u064A\u0631 \u0635\u0627\u0644\u062D \u062F\u0627\u062E\u0644 Telegram.");
+    target = input;
+    inviteUrl = `https://t.me/${input}`;
+  }
+  const kind = resolveSubscriptionKind(target);
+  const label = inviteUrl ? `@${target}` : `ID: ${target}`;
+  return { target, inviteUrl, label, kind };
+}
+function resolveSubscriptionKind(target) {
+  if (/^-100\d+$/.test(target)) return "channel";
+  if (/^-\d+$/.test(target)) return "group";
+  if (/[bB]ot$/.test(target)) return "bot";
+  return "channel";
+}
 
 // server/telegram/secrets.ts
 function getWebhookSecret() {
@@ -1136,6 +1241,197 @@ import { readFile } from "node:fs/promises";
 import dns from "node:dns";
 import net from "node:net";
 import path from "node:path";
+
+// server/telegram/welcomeImage.ts
+import { deflateSync } from "node:zlib";
+var WIDTH = 800;
+var HEIGHT = 450;
+function hexColor(hex) {
+  const value = hex.replace("#", "");
+  return {
+    r: parseInt(value.slice(0, 2), 16),
+    g: parseInt(value.slice(2, 4), 16),
+    b: parseInt(value.slice(4, 6), 16),
+    a: 1
+  };
+}
+function createCanvas() {
+  const data = new Float64Array(WIDTH * HEIGHT * 4);
+  return {
+    put(x, y, color) {
+      const px = Math.floor(x);
+      const py = Math.floor(y);
+      if (px < 0 || py < 0 || px >= WIDTH || py >= HEIGHT) return;
+      const index2 = (py * WIDTH + px) * 4;
+      const srcA = color.a;
+      if (srcA <= 0) return;
+      const dstA = data[index2 + 3];
+      const outA = srcA + dstA * (1 - srcA);
+      if (outA <= 0) return;
+      data[index2] = (color.r * srcA + data[index2] * dstA * (1 - srcA)) / outA;
+      data[index2 + 1] = (color.g * srcA + data[index2 + 1] * dstA * (1 - srcA)) / outA;
+      data[index2 + 2] = (color.b * srcA + data[index2 + 2] * dstA * (1 - srcA)) / outA;
+      data[index2 + 3] = outA;
+    },
+    pixels() {
+      return data;
+    },
+    fillRect(x, y, w, h, color) {
+      for (let py = Math.floor(y); py < Math.floor(y + h); py += 1) {
+        for (let px = Math.floor(x); px < Math.floor(x + w); px += 1) {
+          this.put(px, py, color);
+        }
+      }
+    },
+    fillCircle(cx, cy, radius, color) {
+      for (let py = Math.floor(cy - radius - 1); py <= cy + radius + 1; py += 1) {
+        for (let px = Math.floor(cx - radius - 1); px <= cx + radius + 1; px += 1) {
+          const dx = px - cx;
+          const dy = py - cy;
+          const distance = Math.sqrt(dx * dx + dy * dy);
+          const edge = radius - 0.5;
+          if (distance <= edge) {
+            this.put(px, py, color);
+          } else if (distance < radius + 0.5) {
+            this.put(px, py, { ...color, a: color.a * (radius + 0.5 - distance) });
+          }
+        }
+      }
+    },
+    fillTriangle(a, b, c, color) {
+      const minX = Math.max(0, Math.floor(Math.min(a.x, b.x, c.x)));
+      const maxX = Math.min(WIDTH - 1, Math.ceil(Math.max(a.x, b.x, c.x)));
+      const minY = Math.max(0, Math.floor(Math.min(a.y, b.y, c.y)));
+      const maxY = Math.min(HEIGHT - 1, Math.ceil(Math.max(a.y, b.y, c.y)));
+      const sign = (p1, p2, p3) => (p1.x - p3.x) * (p2.y - p3.y) - (p2.x - p3.x) * (p1.y - p3.y);
+      for (let py = minY; py <= maxY; py += 1) {
+        for (let px = minX; px <= maxX; px += 1) {
+          const point = { x: px + 0.5, y: py + 0.5 };
+          const d1 = sign(point, a, b);
+          const d2 = sign(point, b, c);
+          const d3 = sign(point, c, a);
+          const hasNegative = d1 < 0 || d2 < 0 || d3 < 0;
+          const hasPositive = d1 > 0 || d2 > 0 || d3 > 0;
+          if (!(hasNegative && hasPositive)) this.put(px, py, color);
+        }
+      }
+    }
+  };
+}
+function lerpColor(from, to, t2) {
+  return {
+    r: from.r + (to.r - from.r) * t2,
+    g: from.g + (to.g - from.g) * t2,
+    b: from.b + (to.b - from.b) * t2,
+    a: from.a + (to.a - from.a) * t2
+  };
+}
+function drawDownloadIcon(canvas, centerX, centerY, size, color) {
+  const shaftWidth = size * 0.18;
+  const shaftTop = centerY - size * 0.42;
+  const shaftBottom = centerY + size * 0.05;
+  const headHeight = size * 0.3;
+  const headHalf = size * 0.34;
+  const trayY = centerY + size * 0.22;
+  const trayHeight = size * 0.12;
+  const trayHalf = size * 0.48;
+  canvas.fillRect(centerX - shaftWidth / 2, shaftTop, shaftWidth, shaftBottom - shaftTop, color);
+  canvas.fillTriangle(
+    { x: centerX - headHalf, y: centerY },
+    { x: centerX + headHalf, y: centerY },
+    { x: centerX, y: centerY + headHeight },
+    color
+  );
+  canvas.fillRect(centerX - trayHalf, trayY, trayHalf * 2, trayHeight, color);
+  canvas.fillRect(centerX - trayHalf, trayY + trayHeight, trayHalf * 2, size * 0.05, color);
+}
+function crc32(buffer) {
+  let crc = 4294967295;
+  for (let index2 = 0; index2 < buffer.length; index2 += 1) {
+    crc ^= buffer[index2];
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = crc >>> 1 ^ 3988292384 & -(crc & 1);
+    }
+  }
+  return (crc ^ 4294967295) >>> 0;
+}
+function chunk(type, data) {
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(data.length, 0);
+  const typeBuffer = Buffer.from(type, "ascii");
+  const crcBuffer = Buffer.alloc(4);
+  crcBuffer.writeUInt32BE(crc32(Buffer.concat([typeBuffer, data])), 0);
+  return Buffer.concat([length, typeBuffer, data, crcBuffer]);
+}
+function encodePng(width, height, pixels) {
+  const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 6;
+  ihdr[10] = 0;
+  ihdr[11] = 0;
+  ihdr[12] = 0;
+  const raw = Buffer.alloc(height * (1 + width * 4));
+  for (let y = 0; y < height; y += 1) {
+    const rowStart = y * (1 + width * 4);
+    raw[rowStart] = 0;
+    for (let x = 0; x < width; x += 1) {
+      const index2 = (y * width + x) * 4;
+      const offset = rowStart + 1 + x * 4;
+      raw[offset] = Math.max(0, Math.min(255, Math.round(pixels[index2])));
+      raw[offset + 1] = Math.max(0, Math.min(255, Math.round(pixels[index2 + 1])));
+      raw[offset + 2] = Math.max(0, Math.min(255, Math.round(pixels[index2 + 2])));
+      raw[offset + 3] = Math.max(0, Math.min(255, Math.round(pixels[index2 + 3] * 255)));
+    }
+  }
+  const idat = deflateSync(raw, { level: 9 });
+  return Buffer.concat([
+    signature,
+    chunk("IHDR", ihdr),
+    chunk("IDAT", idat),
+    chunk("IEND", Buffer.alloc(0))
+  ]);
+}
+function renderWelcomeBanner() {
+  const canvas = createCanvas();
+  const topLeft = hexColor("#7C3AED");
+  const bottomRight = hexColor("#EC4899");
+  const gradientFlashes = [hexColor("#6366F1"), hexColor("#F43F5E")];
+  for (let y = 0; y < HEIGHT; y += 1) {
+    for (let x = 0; x < WIDTH; x += 1) {
+      const t2 = (x / WIDTH + y / HEIGHT) / 2;
+      canvas.put(x, y, lerpColor(topLeft, bottomRight, t2));
+    }
+  }
+  const accent = hexColor("#A78BFA");
+  const whiteSoft = { r: 255, g: 255, b: 255, a: 0.07 };
+  const whiteSofter = { r: 255, g: 255, b: 255, a: 0.05 };
+  const flashes = [
+    [gradientFlashes[0], 60, 320, 340],
+    [gradientFlashes[1], 720, 90, 260],
+    [accent, 640, 400, 190]
+  ];
+  for (const [color, cx, cy, radius] of flashes) {
+    const highlight = { ...color, a: 0.1 };
+    canvas.fillCircle(cx, cy, radius, highlight);
+    canvas.fillCircle(cx, cy, radius * 0.7, { ...color, a: 0.07 });
+  }
+  for (let index2 = 0; index2 < 26; index2 += 1) {
+    const px = (index2 * 137 + 61) % WIDTH;
+    const py = (index2 * 89 + 23) % HEIGHT;
+    const radius = 4 + index2 * 31 % 14;
+    canvas.fillCircle(px, py, radius, index2 % 2 === 0 ? whiteSoft : whiteSofter);
+  }
+  const shadow = { r: 0, g: 0, b: 0, a: 0.18 };
+  const iconColor = { r: 255, g: 255, b: 255, a: 0.96 };
+  drawDownloadIcon(canvas, WIDTH / 2 - 8, HEIGHT / 2 - 8, 150, shadow);
+  drawDownloadIcon(canvas, WIDTH / 2, HEIGHT / 2, 150, iconColor);
+  return encodePng(WIDTH, HEIGHT, canvas.pixels());
+}
+
+// server/telegram/telegramApi.ts
 var API_ROOT = "https://api.telegram.org";
 dns.setDefaultResultOrder("ipv4first");
 net.setDefaultAutoSelectFamily(false);
@@ -1201,14 +1497,61 @@ async function sendDownloadedMedia(chatId, choice, localPath, caption) {
   form.set(field, new Blob([file]), path.basename(localPath));
   return telegramRequest(method, form);
 }
-async function sendProjectArchive(chatId, localPath, caption) {
-  const file = await readFile(localPath);
+async function getChatMember(chatId, userId) {
+  return telegramRequest(
+    "getChatMember",
+    JSON.stringify({ chat_id: chatId, user_id: userId }),
+    { "content-type": "application/json" }
+  );
+}
+async function sendPhoto(chatId, photo, caption = "") {
   const form = new FormData();
   form.set("chat_id", chatId);
-  form.set("caption", caption);
-  form.set("parse_mode", "HTML");
-  form.set("document", new Blob([file]), path.basename(localPath));
-  return telegramRequest("sendDocument", form);
+  if (caption) {
+    form.set("caption", caption);
+    form.set("parse_mode", "HTML");
+  }
+  if ("url" in photo) {
+    form.set("photo", photo.url);
+  } else {
+    form.set("photo", new Blob([photo.buffer]), "welcome.png");
+  }
+  return telegramRequest("sendPhoto", form);
+}
+async function sendWelcomePhoto(chatId) {
+  if ((process.env.WELCOME_DISABLE_PHOTO || "").trim() === "1") return false;
+  const customUrl = process.env.WELCOME_PHOTO_URL?.trim();
+  if (customUrl) {
+    await sendPhoto(chatId, { url: customUrl });
+    return true;
+  }
+  await sendPhoto(chatId, { buffer: renderWelcomeBanner() });
+  return true;
+}
+async function sendMediaGroup(chatId, files) {
+  const CHUNK_SIZE = 10;
+  let sent = 0;
+  for (let start = 0; start < files.length; start += CHUNK_SIZE) {
+    const chunk2 = files.slice(start, start + CHUNK_SIZE);
+    const form = new FormData();
+    form.set("chat_id", chatId);
+    const media = chunk2.map((file, index2) => {
+      const input = { type: "photo", media: `attach://file${index2}` };
+      if (index2 === 0 && file.caption) {
+        input.caption = file.caption;
+        input.parse_mode = "HTML";
+      }
+      return input;
+    });
+    form.set("media", JSON.stringify(media));
+    for (let index2 = 0; index2 < chunk2.length; index2 += 1) {
+      const file = await readFile(chunk2[index2].path);
+      form.set(`file${index2}`, new Blob([file]), path.basename(chunk2[index2].path));
+    }
+    await telegramRequest("sendMediaGroup", form);
+    sent += chunk2.length;
+  }
+  return sent;
 }
 async function getWebhookInfo() {
   return telegramRequest(
@@ -1333,13 +1676,13 @@ init_botDb();
 
 // server/telegram/downloader.ts
 import { spawn as spawn2 } from "node:child_process";
-import { mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, rm, stat, writeFile as writeFile2 } from "node:fs/promises";
 import os from "node:os";
-import path4 from "node:path";
+import path5 from "node:path";
 
 // server/telegram/tiktokProfile.ts
 import { spawn } from "node:child_process";
-import path3 from "node:path";
+import path4 from "node:path";
 var PROFILE_CACHE_TTL_MS = 6 * 60 * 60 * 1e3;
 var profileCache = /* @__PURE__ */ new Map();
 var pythonAvailable;
@@ -1582,11 +1925,11 @@ function runWithTimeout(command, args, timeoutMs) {
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
     }, timeoutMs);
-    child.stdout.on("data", (chunk) => {
-      stdout += String(chunk);
+    child.stdout.on("data", (chunk2) => {
+      stdout += String(chunk2);
     });
-    child.stderr.on("data", (chunk) => {
-      stderr += String(chunk);
+    child.stderr.on("data", (chunk2) => {
+      stderr += String(chunk2);
     });
     child.on("error", () => {
       clearTimeout(timer);
@@ -1606,7 +1949,7 @@ function isPythonAvailable() {
 }
 async function fetchViaPython(url) {
   if (!await isPythonAvailable()) return void 0;
-  const scriptPath = path3.resolve(process.cwd(), "scripts", "tiktok_profile.py");
+  const scriptPath = path4.resolve(process.cwd(), "scripts", "tiktok_profile.py");
   const result = await runWithTimeout("python3", [scriptPath, url], 15e3);
   if (result.code !== 0 || !result.stdout) return void 0;
   const trimmed = result.stdout.trim();
@@ -1769,11 +2112,11 @@ function runYtDlp(args, timeoutMs, jobId) {
       child.kill("SIGKILL");
       reject(new DownloaderError("\u0627\u0646\u062A\u0647\u062A \u0645\u0647\u0644\u0629 \u0645\u0639\u0627\u0644\u062C\u0629 \u0627\u0644\u0631\u0627\u0628\u0637. \u062D\u0627\u0648\u0644 \u0645\u0631\u0629 \u0623\u062E\u0631\u0649 \u0644\u0627\u062D\u0642\u0627\u064B."));
     }, timeoutMs);
-    child.stdout.on("data", (chunk) => {
-      stdout += String(chunk);
+    child.stdout.on("data", (chunk2) => {
+      stdout += String(chunk2);
     });
-    child.stderr.on("data", (chunk) => {
-      stderr += String(chunk);
+    child.stderr.on("data", (chunk2) => {
+      stderr += String(chunk2);
     });
     child.on("error", (error) => {
       clearTimeout(timer);
@@ -2010,7 +2353,8 @@ async function inspectMediaLink(rawUrl, jobId) {
     const ext = String(format.ext || "").toLowerCase();
     return imageExtensions.includes(ext) && (!format.vcodec || format.vcodec === "none");
   });
-  const hasImage = hasImageFormat || Boolean(imageUrlsFromMetadata(metadata).length);
+  const sourceImageUrls = imageUrlsFromMetadata(metadata);
+  const hasImage = hasImageFormat || Boolean(sourceImageUrls.length);
   const choices = [];
   if (hasVideo) choices.push(story ? "story" : "video");
   if (hasAudio) choices.push("audio");
@@ -2033,16 +2377,17 @@ async function inspectMediaLink(rawUrl, jobId) {
     title: cleanTitle(metadata.title),
     choices,
     durationSeconds: typeof metadata.duration === "number" ? metadata.duration : void 0,
-    thumbnail: imageUrlFromMetadata(metadata)
+    thumbnail: sourceImageUrls[0]
   };
+  if (sourceImageUrls.length > 1) result.imageCount = sourceImageUrls.length;
   if (enrichedAccount) result.account = enrichedAccount;
   return result;
 }
 async function downloadMedia(rawUrl, choice, jobId) {
   let { url, platform } = inspectSupportedUrl(rawUrl);
   if (platform === "tiktok") url = await resolveTikTokPublicUrl(url);
-  const workdir = await mkdtemp(path4.join(os.tmpdir(), `telegram-media-${jobId}-`));
-  const output = path4.join(workdir, "media.%(ext)s");
+  const workdir = await mkdtemp(path5.join(os.tmpdir(), `telegram-media-${jobId}-`));
+  const output = path5.join(workdir, "media.%(ext)s");
   if (choice === "image") {
     try {
       const metadata = await loadMetadata(url.toString(), jobId);
@@ -2057,8 +2402,8 @@ async function downloadMedia(rawUrl, choice, jobId) {
       const bytes = Buffer.from(await response.arrayBuffer());
       if (bytes.byteLength > MAX_MEDIA_BYTES) throw new DownloaderError("\u062D\u062C\u0645 \u0627\u0644\u0635\u0648\u0631\u0629 \u0623\u0643\u0628\u0631 \u0645\u0646 \u0627\u0644\u062D\u062F \u0627\u0644\u0622\u0645\u0646 \u0644\u0644\u0625\u0631\u0633\u0627\u0644 \u0639\u0628\u0631 \u0627\u0644\u0628\u0648\u062A.");
       const extension = contentType.includes("png") ? "png" : contentType.includes("webp") ? "webp" : "jpg";
-      const filePath = path4.join(workdir, `media.${extension}`);
-      await writeFile(filePath, bytes);
+      const filePath = path5.join(workdir, `media.${extension}`);
+      await writeFile2(filePath, bytes);
       return { workdir, filePath, bytes: bytes.byteLength };
     } catch (error) {
       await rm(workdir, { recursive: true, force: true });
@@ -2074,7 +2419,7 @@ async function downloadMedia(rawUrl, choice, jobId) {
   args.push(url.toString());
   try {
     await runYtDlpWithRetry(args, DOWNLOAD_TIMEOUT_MS, jobId);
-    const files = (await readdir(workdir)).filter((file) => !file.endsWith(".part") && !file.endsWith(".ytdl")).map((file) => path4.join(workdir, file));
+    const files = (await readdir(workdir)).filter((file) => !file.endsWith(".part") && !file.endsWith(".ytdl")).map((file) => path5.join(workdir, file));
     if (!files.length) throw new DownloaderError("\u0627\u0643\u062A\u0645\u0644 \u0627\u0644\u0637\u0644\u0628 \u062F\u0648\u0646 \u0645\u0644\u0641 \u0642\u0627\u0628\u0644 \u0644\u0644\u0625\u0631\u0633\u0627\u0644.");
     const candidate = files[0];
     const fileInfo = await stat(candidate);
@@ -2090,6 +2435,39 @@ async function downloadMedia(rawUrl, choice, jobId) {
 async function purgeDownloadedMedia(workdir) {
   await rm(workdir, { recursive: true, force: true });
 }
+async function writeRemoteImage(url, destination) {
+  const response = await fetch(url);
+  if (!response.ok) throw new DownloaderError("\u0631\u0641\u0636 \u0627\u0644\u0645\u0635\u062F\u0631 \u062C\u0644\u0628 \u0625\u062D\u062F\u0649 \u0627\u0644\u0635\u0648\u0631 \u062D\u0627\u0644\u064A\u0627\u064B. \u062C\u0631\u0651\u0628 \u0627\u0644\u0631\u0627\u0628\u0637 \u0645\u0631\u0629 \u0623\u062E\u0631\u0649 \u0644\u0627\u062D\u0642\u0627\u064B.");
+  const contentType = response.headers.get("content-type") || "image/jpeg";
+  if (!contentType.startsWith("image/")) throw new DownloaderError("\u0623\u062D\u062F \u0627\u0644\u0645\u0644\u0641\u0627\u062A \u0627\u0644\u062A\u064A \u0623\u0631\u062C\u0639\u0647\u0627 \u0627\u0644\u0645\u0635\u062F\u0631 \u0644\u064A\u0633 \u0635\u0648\u0631\u0629 \u0635\u0627\u0644\u062D\u0629.");
+  const bytes = Buffer.from(await response.arrayBuffer());
+  if (bytes.byteLength > MAX_MEDIA_BYTES) throw new DownloaderError("\u062D\u062C\u0645 \u0625\u062D\u062F\u0649 \u0627\u0644\u0635\u0648\u0631 \u0623\u0643\u0628\u0631 \u0645\u0646 \u0627\u0644\u062D\u062F \u0627\u0644\u0622\u0645\u0646 \u0644\u0644\u0625\u0631\u0633\u0627\u0644 \u0639\u0628\u0631 \u0627\u0644\u0628\u0648\u062A.");
+  await writeFile2(destination, bytes);
+  return bytes.byteLength;
+}
+function extensionForUrl(url) {
+  return /\.png(?:$|[?#])/i.test(url) ? "png" : /\.webp(?:$|[?#])/i.test(url) ? "webp" : /\.gif(?:$|[?#])/i.test(url) ? "gif" : "jpg";
+}
+async function downloadAllImages(rawUrl, jobId) {
+  const workdir = await mkdtemp(path5.join(os.tmpdir(), `telegram-gallery-${jobId}-`));
+  try {
+    const metadata = await loadMetadata(rawUrl, jobId);
+    const urls = Array.from(new Set(imageUrlsFromMetadata(metadata)));
+    if (!urls.length) throw new DownloaderError("\u0644\u0645 \u064A\u0624\u0643\u062F \u0627\u0644\u0645\u0635\u062F\u0631 \u0631\u0648\u0627\u0628\u0637 \u0635\u0648\u0631 \u0642\u0627\u0628\u0644\u0629 \u0644\u0644\u0625\u0631\u0633\u0627\u0644. \u062A\u062D\u0642\u0642 \u0623\u0646 \u0627\u0644\u0645\u0634\u0627\u0631\u0643\u0629 \u0639\u0627\u0645\u0629 \u0648\u0645\u062A\u0627\u062D\u0629.");
+    const files = [];
+    let totalBytes = 0;
+    for (let index2 = 0; index2 < urls.length; index2 += 1) {
+      const filePath = path5.join(workdir, `media-${index2 + 1}.${extensionForUrl(urls[index2])}`);
+      const bytes = await writeRemoteImage(urls[index2], filePath);
+      totalBytes += bytes;
+      files.push({ path: filePath });
+    }
+    return { workdir, files, bytes: totalBytes };
+  } catch (error) {
+    await rm(workdir, { recursive: true, force: true });
+    throw error;
+  }
+}
 
 // server/telegram/downloadQueue.ts
 var DownloadQueueError = class extends Error {
@@ -2098,23 +2476,36 @@ var DownloadQueueError = class extends Error {
     this.name = "DownloadQueueError";
   }
 };
-var MAX_CONCURRENT_DOWNLOADS = 2;
-var MAX_QUEUED_DOWNLOADS = 12;
-var active = 0;
 var pending = [];
+var active = 0;
+var startedTotal = 0;
+var completedTotal = 0;
+function configNumber(name, fallback, min, max) {
+  const raw = Number(process.env[name]);
+  if (!Number.isFinite(raw)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(raw)));
+}
+function maxConcurrent() {
+  return configNumber("DOWNLOAD_MAX_CONCURRENT", 8, 1, 64);
+}
+function maxWaiting() {
+  return configNumber("DOWNLOAD_MAX_WAITING", 1e3, 10, 5e4);
+}
 function pumpQueue() {
-  while (active < MAX_CONCURRENT_DOWNLOADS && pending.length) {
+  while (active < maxConcurrent() && pending.length) {
     const task = pending.shift();
     active += 1;
+    startedTotal += 1;
     task.run().then(task.resolve, task.reject).finally(() => {
       active -= 1;
+      completedTotal += 1;
       pumpQueue();
     });
   }
 }
 function scheduleDownload(run) {
-  if (pending.length >= MAX_QUEUED_DOWNLOADS) {
-    throw new DownloadQueueError("\u0627\u0644\u0628\u0648\u062A \u0645\u0634\u063A\u0648\u0644 \u062D\u0627\u0644\u064A\u0627\u064B \u0628\u0639\u062F\u0629 \u062A\u0646\u0632\u064A\u0644\u0627\u062A. \u0627\u0646\u062A\u0638\u0631 \u062F\u0642\u064A\u0642\u0629 \u062B\u0645 \u062D\u0627\u0648\u0644 \u0645\u062C\u062F\u062F\u0627\u064B.");
+  if (pending.length >= maxWaiting()) {
+    throw new DownloadQueueError("\u0627\u0644\u0628\u0648\u062A \u064A\u0639\u0627\u0644\u062C \u062D\u0627\u0644\u064A\u0627\u064B \u0639\u062F\u062F\u0627\u064B \u0643\u0628\u064A\u0631\u0627\u064B \u0645\u0646 \u0627\u0644\u062A\u0646\u0632\u064A\u0644\u0627\u062A. \u0623\u0639\u062F \u0627\u0644\u0645\u062D\u0627\u0648\u0644\u0629 \u0628\u0639\u062F \u0644\u062D\u0638\u0627\u062A.");
   }
   const position = active + pending.length + 1;
   const completion = new Promise((resolve, reject) => {
@@ -2124,101 +2515,77 @@ function scheduleDownload(run) {
   return { position, completion };
 }
 function getDownloadQueueStats() {
-  return { active, waiting: pending.length, maxConcurrent: MAX_CONCURRENT_DOWNLOADS, maxWaiting: MAX_QUEUED_DOWNLOADS };
+  return {
+    active,
+    waiting: pending.length,
+    maxConcurrent: maxConcurrent(),
+    maxWaiting: maxWaiting(),
+    started: startedTotal,
+    completed: completedTotal
+  };
 }
 
 // server/telegram/botService.ts
 init_policy();
 
-// server/telegram/projectArchive.ts
-import { execFile } from "node:child_process";
-import { mkdtemp as mkdtemp2, rm as rm2, stat as stat2 } from "node:fs/promises";
-import os2 from "node:os";
-import path5 from "node:path";
-import { promisify } from "node:util";
-var execFileAsync = promisify(execFile);
-var MAX_ARCHIVE_BYTES = 45 * 1024 * 1024;
-var PROJECT_ENTRIES = [
-  "client",
-  "server",
-  "drizzle",
-  "shared",
-  "patches",
-  "scripts",
-  "package.json",
-  "pnpm-lock.yaml",
-  "tsconfig.json",
-  "vite.config.ts",
-  "drizzle.config.ts",
-  "components.json",
-  "Dockerfile",
-  "README.md",
-  "todo.md",
-  "facebook-link-investigation.md",
-  "production-verification.md"
-];
-var ProjectArchiveError = class extends Error {
-  constructor(message) {
-    super(message);
-    this.name = "ProjectArchiveError";
-  }
-};
-async function availableProjectEntries(projectRoot) {
-  const entries = await Promise.all(PROJECT_ENTRIES.map(async (entry) => {
-    try {
-      await stat2(path5.join(projectRoot, entry));
-      return entry;
-    } catch {
-      return void 0;
-    }
-  }));
-  return entries.filter((entry) => Boolean(entry));
-}
-async function createProjectArchive(projectRoot = process.cwd()) {
-  const entries = await availableProjectEntries(projectRoot);
-  if (!entries.length) throw new ProjectArchiveError("\u062A\u0639\u0630\u0631 \u0627\u0644\u0639\u062B\u0648\u0631 \u0639\u0644\u0649 \u0645\u0644\u0641\u0627\u062A \u0627\u0644\u0645\u0634\u0631\u0648\u0639 \u0627\u0644\u0642\u0627\u0628\u0644\u0629 \u0644\u0644\u062A\u0635\u062F\u064A\u0631 \u0641\u064A \u0628\u064A\u0626\u0629 \u0627\u0644\u0627\u0633\u062A\u0636\u0627\u0641\u0629.");
-  const workdir = await mkdtemp2(path5.join(os2.tmpdir(), "telegram-project-export-"));
-  const archivePath = path5.join(workdir, "telegram-media-downloader-project.zip");
-  try {
-    await execFileAsync("zip", ["-q", "-r", archivePath, ...entries], {
-      cwd: projectRoot,
-      timeout: 9e4,
-      maxBuffer: 2 * 1024 * 1024
-    });
-    const archive = await stat2(archivePath);
-    if (archive.size > MAX_ARCHIVE_BYTES) {
-      throw new ProjectArchiveError("\u062D\u062C\u0645 \u0646\u0633\u062E\u0629 \u0627\u0644\u0645\u0634\u0631\u0648\u0639 \u0623\u0643\u0628\u0631 \u0645\u0646 \u0627\u0644\u062D\u062F \u0627\u0644\u0622\u0645\u0646 \u0644\u0644\u0625\u0631\u0633\u0627\u0644 \u0639\u0628\u0631 \u0627\u0644\u0628\u0648\u062A.");
-    }
-    return { archivePath, workdir, bytes: archive.size };
-  } catch (error) {
-    await rm2(workdir, { recursive: true, force: true });
-    if (error instanceof ProjectArchiveError) throw error;
-    throw new ProjectArchiveError("\u062A\u0639\u0630\u0631 \u0625\u0646\u0634\u0627\u0621 \u0646\u0633\u062E\u0629 \u0627\u0644\u0645\u0634\u0631\u0648\u0639 \u0627\u0644\u0622\u0646. \u062D\u0627\u0648\u0644 \u0645\u0631\u0629 \u0623\u062E\u0631\u0649 \u0644\u0627\u062D\u0642\u0627\u064B.");
-  }
-}
-async function purgeProjectArchive(workdir) {
-  await rm2(workdir, { recursive: true, force: true });
-}
-
 // server/telegram/messages.ts
 function escapeHtml(value) {
   return value.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" })[char] || char);
 }
-function welcomeText(name) {
-  return `\u2726 \u0623\u0647\u0644\u0627\u064B <b>${escapeHtml(name)}</b>
+function languageLabel(code) {
+  if (!code) return void 0;
+  const normalized = code.toLowerCase();
+  const labels = {
+    ar: "\u0627\u0644\u0639\u0631\u0628\u064A\u0629",
+    en: "\u0627\u0644\u0625\u0646\u062C\u0644\u064A\u0632\u064A\u0629",
+    fr: "\u0627\u0644\u0641\u0631\u0646\u0633\u064A\u0629",
+    es: "\u0627\u0644\u0625\u0633\u0628\u0627\u0646\u064A\u0629",
+    de: "\u0627\u0644\u0623\u0644\u0645\u0627\u0646\u064A\u0629",
+    ru: "\u0627\u0644\u0631\u0648\u0633\u064A\u0629",
+    tr: "\u0627\u0644\u062A\u0631\u0643\u064A\u0629",
+    fa: "\u0627\u0644\u0641\u0627\u0631\u0633\u064A\u0629",
+    ur: "\u0627\u0644\u0623\u0631\u062F\u064A\u0629",
+    hi: "\u0627\u0644\u0647\u0646\u062F\u064A\u0629",
+    id: "\u0627\u0644\u0625\u0646\u062F\u0648\u0646\u064A\u0633\u064A\u0629",
+    pt: "\u0627\u0644\u0628\u0631\u062A\u063A\u0627\u0644\u064A\u0629",
+    it: "\u0627\u0644\u0625\u064A\u0637\u0627\u0644\u064A\u0629",
+    nl: "\u0627\u0644\u0647\u0648\u0644\u0646\u062F\u064A\u0629",
+    zh: "\u0627\u0644\u0635\u064A\u0646\u064A\u0629",
+    ja: "\u0627\u0644\u064A\u0627\u0628\u0627\u0646\u064A\u0629",
+    ko: "\u0627\u0644\u0643\u0648\u0631\u064A\u0629",
+    pl: "\u0627\u0644\u0628\u0648\u0644\u0646\u062F\u064A\u0629",
+    uk: "\u0627\u0644\u0623\u0648\u0643\u0631\u0627\u0646\u064A\u0629",
+    vi: "\u0627\u0644\u0641\u064A\u062A\u0646\u0627\u0645\u064A\u0629"
+  };
+  return labels[normalized] || normalized;
+}
+function userCard(info) {
+  if (!info) return "";
+  const lines = ["\u{1F9FE} <b>\u0628\u064A\u0627\u0646\u0627\u062A \u0645\u0644\u0641\u0643</b>"];
+  if (info.username) lines.push(`\u0627\u0644\u0645\u0639\u0631\u0641: @${escapeHtml(info.username)}`);
+  const language = languageLabel(info.language);
+  if (language) lines.push(`\u0627\u0644\u0644\u063A\u0629: ${escapeHtml(language)}`);
+  if (info.firstSeen) lines.push(`\u0623\u0648\u0644 \u0627\u0633\u062A\u062E\u062F\u0627\u0645: ${info.firstSeen.toLocaleDateString("ar-EG", { day: "numeric", month: "long", year: "numeric" })}`);
+  return `
 
-\u0623\u0646\u0627 \u0628\u0648\u062A \u062A\u0646\u0632\u064A\u0644 \u0627\u0644\u0648\u0633\u0627\u0626\u0637 \u0627\u0644\u0639\u0627\u0645\u0629. \u0623\u0631\u0633\u0644 \u0631\u0627\u0628\u0637\u0627\u064B \u0648\u0627\u062D\u062F\u0627\u064B \u0648\u0633\u0623\u0639\u0631\u0636 \u0627\u0644\u062E\u064A\u0627\u0631\u0627\u062A \u0627\u0644\u0645\u062A\u0627\u062D\u0629: <b>\u0641\u064A\u062F\u064A\u0648</b> \u0623\u0648 <b>\u0635\u0648\u062A</b> \u0623\u0648 <b>\u0635\u0648\u0631\u0629 \u0623\u0635\u0644\u064A\u0629</b> \u0623\u0648 <b>\u0633\u062A\u0648\u0631\u064A</b>.
+${lines.join("\n")}`;
+}
+function welcomeText(name, info) {
+  return `\u2726 <b>\u0623\u0647\u0644\u0627\u064B \u0628\u0643 \u064A\u0627 ${escapeHtml(name)}</b> \u{1F3AC}
+
+\u0623\u0646\u0627 \u0628\u0648\u062A \u062A\u062D\u0645\u064A\u0644 \u0627\u0644\u0648\u0633\u0627\u0626\u0637 \u0627\u0644\u0639\u0627\u0645\u0629. \u0623\u0631\u0633\u0644 \u0631\u0627\u0628\u0637\u0627\u064B \u0648\u0627\u062D\u062F\u0627\u064B \u0648\u0633\u0623\u0639\u0631\u0636 \u0644\u0643 \u0645\u0627 \u064A\u0645\u0643\u0646 \u062A\u0646\u0632\u064A\u0644\u0647 \u0645\u0646: <b>\u0641\u064A\u062F\u064A\u0648</b> \u2022 <b>\u0635\u0648\u062A</b> \u2022 <b>\u0627\u0644\u0635\u0648\u0631 \u0643\u0627\u0645\u0644\u0629</b> \u2022 <b>\u0633\u062A\u0648\u0631\u064A</b>.
+${userCard(info)}
 
 <b>\u0627\u0644\u0645\u0646\u0635\u0627\u062A \u0627\u0644\u0645\u062F\u0639\u0648\u0645\u0629</b>
 TikTok \u2022 Instagram \u2022 Facebook \u2022 Snapchat \u2022 Pinterest \u2022 Twitter/X
 
 <b>\u0639\u0644\u0649 TikTok \u0623\u0639\u0631\u0636 \u0644\u0643 \u0623\u064A\u0636\u0627\u064B \u0628\u0637\u0627\u0642\u0629 \u0627\u0644\u062D\u0633\u0627\u0628</b>
-\u0627\u0644\u0627\u0633\u0645\u060C \u0627\u0633\u0645 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u060C \u0627\u0644\u0645\u062A\u0627\u0628\u0639\u064A\u0646\u060C \u0627\u0644\u0645\u0646\u0634\u0648\u0631\u0627\u062A\u060C \u0648\u0627\u0644\u062F\u0648\u0644\u0629 \u2014 \u0628\u0634\u0643\u0644 \u062D\u0642\u064A\u0642\u064A \u0645\u0646 \u0628\u064A\u0627\u0646\u0627\u062A \u0627\u0644\u062D\u0633\u0627\u0628 \u0627\u0644\u0639\u0627\u0645.
+\u0627\u0644\u0627\u0633\u0645\u060C \u0627\u0633\u0645 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u060C \u0627\u0644\u0645\u062A\u0627\u0628\u0639\u064A\u0646\u060C \u0627\u0644\u0645\u0646\u0634\u0648\u0631\u0627\u062A\u060C \u0648\u0627\u0644\u062F\u0648\u0644\u0629 \u2014 \u0645\u0646 \u0627\u0644\u0628\u064A\u0627\u0646\u0627\u062A \u0627\u0644\u0639\u0627\u0645\u0629 \u0644\u0644\u062D\u0633\u0627\u0628\u060C \u0645\u0639 \u0639\u062F\u062F \u0635\u0648\u0631 \u0627\u0644\u0645\u0634\u0627\u0631\u0643\u0629 \u0625\u0630\u0627 \u0643\u0627\u0646\u062A \u0645\u062A\u0639\u062F\u062F\u0629.
 
 <b>\u0628\u062B\u0644\u0627\u062B \u062E\u0637\u0648\u0627\u062A</b>
 \u2460 \u0627\u0646\u0633\u062E \u0631\u0627\u0628\u0637 \u0627\u0644\u0645\u0646\u0634\u0648\u0631 \u0623\u0648 \u0627\u0644\u0641\u064A\u062F\u064A\u0648 \u0623\u0648 \u0627\u0644\u0642\u0635\u0629 \u0627\u0644\u0639\u0627\u0645\u0629.
 \u2461 \u0623\u0631\u0633\u0644\u0647 \u0647\u0646\u0627 \u0643\u0645\u0627 \u0647\u0648\u060C \u0645\u0646 \u062F\u0648\u0646 \u0625\u0636\u0627\u0641\u0629 \u0646\u0635 \u0622\u062E\u0631.
-\u2462 \u0627\u062E\u062A\u0631 \u0641\u064A\u062F\u064A\u0648 \u0623\u0648 \u0635\u0648\u062A\u0627\u064B \u0623\u0648 \u0635\u0648\u0631\u0629 \u0623\u0648 \u0633\u062A\u0648\u0631\u064A \u0639\u0646\u062F\u0645\u0627 \u064A\u0624\u0643\u062F \u0627\u0644\u0645\u0635\u062F\u0631 \u062A\u0648\u0627\u0641\u0631\u0647\u0627.
+\u2462 \u0627\u0646\u0642\u0631 \u0646\u0648\u0639 \u0627\u0644\u0645\u0644\u0641 \u0627\u0644\u0630\u064A \u062A\u0631\u064A\u062F \u062A\u0646\u0632\u064A\u0644\u0647 \u0639\u0646\u062F\u0645\u0627 \u064A\u0624\u0643\u062F \u0627\u0644\u0645\u0635\u062F\u0631 \u062A\u0648\u0641\u0631\u0647.
 
 \u0644\u0627 \u0623\u0642\u0628\u0644 \u0627\u0644\u062D\u0633\u0627\u0628\u0627\u062A \u0627\u0644\u062E\u0627\u0635\u0629 \u0623\u0648 \u0627\u0644\u0645\u062D\u062A\u0648\u0649 \u0627\u0644\u0645\u062D\u0645\u064A. \u0627\u0633\u062A\u062E\u062F\u0645 \u0627\u0644\u0631\u0648\u0627\u0628\u0637 \u0627\u0644\u0639\u0627\u0645\u0629 \u0627\u0644\u062A\u064A \u062A\u0645\u0644\u0643 \u062D\u0642 \u062A\u0646\u0632\u064A\u0644\u0647\u0627 \u0641\u0642\u0637.`;
 }
@@ -2226,13 +2593,11 @@ var HELP_TEXT = `\u2754 <b>\u0643\u064A\u0641 \u0623\u0633\u062A\u062E\u062F\u06
 
 \u0623\u0631\u0633\u0644 \u0631\u0627\u0628\u0637\u0627\u064B \u0639\u0627\u0645\u0627\u064B \u0648\u0627\u062D\u062F\u0627\u064B \u0641\u0642\u0637. \u064A\u062F\u0639\u0645 \u0627\u0644\u0628\u0648\u062A TikTok \u0648Instagram \u0648Facebook \u0648Snapchat \u0648Pinterest \u0648Twitter/X. \u0641\u064A Twitter/X \u0627\u0633\u062A\u062E\u062F\u0645 \u0631\u0627\u0628\u0637 \u0627\u0644\u0645\u0646\u0634\u0648\u0631 \u0628\u0635\u064A\u063A\u0629 <code>https://x.com/\u0627\u0633\u0645_\u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645/status/123</code>\u060C \u0648\u0644\u064A\u0633 \u0631\u0627\u0628\u0637 \u0627\u0644\u062D\u0633\u0627\u0628.
 
-\u0628\u0639\u062F \u0627\u0644\u0641\u062D\u0635 \u0633\u062A\u0638\u0647\u0631 \u0627\u0644\u0623\u0632\u0631\u0627\u0631 \u0627\u0644\u0645\u0646\u0627\u0633\u0628\u0629: \u0641\u064A\u062F\u064A\u0648 \u0623\u0648 \u0635\u0648\u062A \u0623\u0648 \u0635\u0648\u0631\u0629 \u0623\u0635\u0644\u064A\u0629 \u0623\u0648 \u0633\u062A\u0648\u0631\u064A. \u0644\u0627 \u064A\u0638\u0647\u0631 \u0627\u0644\u062E\u064A\u0627\u0631 \u0625\u0644\u0627 \u0639\u0646\u062F\u0645\u0627 \u064A\u0624\u0643\u062F \u0627\u0644\u0645\u0635\u062F\u0631 \u0648\u062C\u0648\u062F\u0647. \u0642\u0635\u0635 Instagram \u0648Facebook \u0648Snapchat \u062A\u0638\u0647\u0631 \u0639\u0628\u0631 \u0632\u0631 <b>\u062A\u0646\u0632\u064A\u0644 \u0627\u0644\u0633\u062A\u0648\u0631\u064A</b> \u0625\u0630\u0627 \u0643\u0627\u0646 \u0627\u0644\u0631\u0627\u0628\u0637 \u0639\u0627\u0645\u0627\u064B \u0648\u0645\u0627 \u0632\u0627\u0644 \u0627\u0644\u0645\u0635\u062F\u0631 \u064A\u062A\u064A\u062D\u0647.
+\u0628\u0639\u062F \u0627\u0644\u0641\u062D\u0635 \u062A\u0638\u0647\u0631 \u0627\u0644\u0623\u0632\u0631\u0627\u0631 \u0627\u0644\u0645\u0646\u0627\u0633\u0628\u0629: \u0641\u064A\u062F\u064A\u0648 \u0623\u0648 \u0635\u0648\u062A \u0623\u0648 \u0635\u0648\u0631\u0629 \u0623\u0635\u0644\u064A\u0629 \u0623\u0648 \u0633\u062A\u0648\u0631\u064A. \u0627\u0644\u0645\u0634\u0627\u0631\u0643\u0627\u062A \u0627\u0644\u0645\u062A\u0639\u062F\u062F\u0629 \u0627\u0644\u0635\u0648\u0631 \u062A\u0639\u0631\u0636 \u0639\u062F\u062F \u0627\u0644\u0635\u0648\u0631 \u0648\u0632\u0631 <b>\u062A\u0646\u0632\u064A\u0644 \u0627\u0644\u0635\u0648\u0631 \u0643\u0627\u0645\u0644\u0629</b>.
 
-\u0639\u0644\u0649 \u0631\u0648\u0627\u0628\u0637 TikTok \u064A\u064F\u0639\u0631\u0636 \u0623\u064A\u0636\u0627\u064B \u0643\u0634\u0641 \u062D\u0633\u0627\u0628 \u0627\u0644\u0646\u0627\u0634\u0631 \u0639\u0646\u062F \u062A\u0648\u0641\u0631 \u0627\u0644\u0628\u064A\u0627\u0646\u0627\u062A: \u0627\u0644\u0627\u0633\u0645\u060C \u0627\u0633\u0645 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u060C \u0639\u062F\u062F \u0627\u0644\u0645\u062A\u0627\u0628\u0639\u064A\u0646 \u0648\u0627\u0644\u0645\u0646\u0634\u0648\u0631\u0627\u062A \u0648\u0627\u0644\u062F\u0648\u0644\u0629.
+\u0639\u0644\u0649 \u0631\u0648\u0627\u0628\u0637 TikTok \u064A\u064F\u0639\u0631\u0636 \u0623\u064A\u0636\u0627\u064B \u0643\u0634\u0641 \u062D\u0633\u0627\u0628 \u0627\u0644\u0646\u0627\u0634\u0631 \u0639\u0646\u062F \u062A\u0648\u0641\u0631 \u0627\u0644\u0628\u064A\u0627\u0646\u0627\u062A.
 
-\u0627\u0633\u062A\u062E\u062F\u0645 \u0632\u0631 <b>\u0625\u0644\u063A\u0627\u0621 \u0627\u0644\u0639\u0645\u0644\u064A\u0629</b> \u0644\u0625\u064A\u0642\u0627\u0641 \u0627\u0644\u0641\u062D\u0635 \u0623\u0648 \u0627\u0644\u062A\u0646\u0632\u064A\u0644 \u0627\u0644\u062D\u0627\u0644\u064A. \u0644\u0644\u0628\u0644\u0627\u063A\u0627\u062A\u060C \u0627\u0636\u063A\u0637 <b>\u0625\u0631\u0633\u0627\u0644 \u0628\u0644\u0627\u063A</b> \u0648\u0623\u0631\u0633\u0644 \u0627\u0644\u0631\u0627\u0628\u0637 \u0645\u0639 \u0627\u0644\u0633\u0628\u0628.
-
-\u0642\u062F \u064A\u0631\u0641\u0636 \u0627\u0644\u0645\u0635\u062F\u0631 \u0627\u0644\u0631\u0627\u0628\u0637 \u0627\u0644\u062E\u0627\u0635 \u0623\u0648 \u0627\u0644\u0645\u062D\u0645\u064A \u0623\u0648 \u0627\u0644\u0645\u0644\u0641 \u0627\u0644\u0643\u0628\u064A\u0631 \u0623\u0648 \u064A\u062D\u062C\u0628 \u0637\u0644\u0628\u0627\u062A \u0627\u0644\u062E\u0627\u062F\u0645 \u0645\u0624\u0642\u062A\u0627\u064B\u061B \u0639\u0646\u062F\u0647\u0627 \u0633\u062A\u0635\u0644\u0643 \u0631\u0633\u0627\u0644\u0629 \u0648\u0627\u0636\u062D\u0629 \u0648\u064A\u0645\u0643\u0646\u0643 \u062A\u062C\u0631\u0628\u0629 \u0631\u0627\u0628\u0637 \u0639\u0627\u0645 \u0622\u062E\u0631.`;
+\u0627\u0633\u062A\u062E\u062F\u0645 \u0632\u0631 <b>\u0625\u0644\u063A\u0627\u0621 \u0627\u0644\u0639\u0645\u0644\u064A\u0629</b> \u0644\u0625\u064A\u0642\u0627\u0641 \u0627\u0644\u0641\u062D\u0635 \u0623\u0648 \u0627\u0644\u062A\u0646\u0632\u064A\u0644 \u0627\u0644\u062D\u0627\u0644\u064A. \u0644\u0644\u0628\u0644\u0627\u063A\u0627\u062A\u060C \u0627\u0636\u063A\u0637 <b>\u0625\u0631\u0633\u0627\u0644 \u0628\u0644\u0627\u063A</b>.`;
 var REPORT_TEXT = `\u0644\u0625\u0631\u0633\u0627\u0644 \u0628\u0644\u0627\u063A\u060C \u0627\u0643\u062A\u0628 \u0627\u0644\u0631\u0633\u0627\u0644\u0629 \u0628\u0647\u0630\u0627 \u0627\u0644\u0634\u0643\u0644:
 <code>/report \u0627\u0644\u0631\u0627\u0628\u0637 \u0623\u0648 \u0627\u0644\u0645\u0639\u0631\u0651\u0641 | \u0627\u0644\u0633\u0628\u0628</code>
 
@@ -2255,30 +2620,90 @@ function inlineButton(text2, callbackData, style, iconEnv) {
 }
 var USER_KEYBOARD = {
   keyboard: [
-    [replyButton("\u2754 \u0637\u0631\u064A\u0642\u0629 \u0627\u0644\u0627\u0633\u062A\u062E\u062F\u0627\u0645", "primary"), replyButton("\u{1F6D1} \u0625\u0644\u063A\u0627\u0621 \u0627\u0644\u0639\u0645\u0644\u064A\u0629", "danger")],
-    [replyButton("\u{1F4E9} \u0625\u0631\u0633\u0627\u0644 \u0628\u0644\u0627\u063A", "primary")]
-  ],
-  resize_keyboard: true,
-  is_persistent: true
-};
-var OWNER_KEYBOARD = {
-  keyboard: [
-    [replyButton("\u{1F4CA} \u0627\u0644\u0625\u062D\u0635\u0627\u0621\u0627\u062A", "success"), replyButton("\u{1F465} \u0622\u062E\u0631 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646", "primary")],
-    [replyButton("\u2705 \u0627\u0644\u0646\u0634\u0637\u0648\u0646", "primary"), replyButton("\u{1F319} \u063A\u064A\u0631 \u0627\u0644\u0646\u0634\u0637\u064A\u0646", "primary"), replyButton("\u{1F6AB} \u0627\u0644\u0645\u062D\u0638\u0648\u0631\u0648\u0646", "primary")],
-    [replyButton("\u{1F6AB} \u062D\u0638\u0631 \u0645\u0633\u062A\u062E\u062F\u0645", "danger"), replyButton("\u2705 \u0641\u0643 \u0627\u0644\u062D\u0638\u0631", "success")],
-    [replyButton("\u{1F4E3} \u0625\u0631\u0633\u0627\u0644 \u0644\u0644\u062C\u0645\u064A\u0639", "primary"), replyButton("\u2699\uFE0F \u0633\u0639\u0629 \u0627\u0644\u0628\u0648\u062A", "primary")],
-    [replyButton("\u{1F9F9} \u062A\u0646\u0638\u064A\u0641 \u0627\u0644\u0622\u0646", "danger"), replyButton("\u23F1\uFE0F \u0645\u062F\u0629 \u0627\u0644\u062A\u0646\u0638\u064A\u0641", "primary")],
-    [replyButton("\u{1F451} \u0627\u0644\u0645\u0644\u0627\u0643", "primary"), replyButton("\u2795 \u0625\u0636\u0627\u0641\u0629 \u0645\u0627\u0644\u0643", "success"), replyButton("\u2796 \u062D\u0630\u0641 \u0645\u0627\u0644\u0643", "danger")],
-    [replyButton("\u{1F4E6} \u062A\u062D\u0645\u064A\u0644 \u0646\u0633\u062E\u0629 \u0627\u0644\u0645\u0634\u0631\u0648\u0639", "success")],
-    [replyButton("\u{1F4CB} \u0623\u062E\u0637\u0627\u0621 \u062D\u062F\u064A\u062B\u0629", "primary"), replyButton("\u21A9\uFE0F \u0625\u0644\u063A\u0627\u0621 \u0627\u0644\u0625\u062F\u062E\u0627\u0644", "primary")],
+    [replyButton("\u{1F680} \u062A\u0634\u063A\u064A\u0644 \u0627\u0644\u0628\u0648\u062A", "success")],
+    [replyButton("\u2754 \u0637\u0631\u064A\u0642\u0629 \u0627\u0644\u0627\u0633\u062A\u062E\u062F\u0627\u0645", "primary"), replyButton("\u{1F4E9} \u0625\u0631\u0633\u0627\u0644 \u0628\u0644\u0627\u063A", "primary")],
     [replyButton("\u{1F6D1} \u0625\u0644\u063A\u0627\u0621 \u0627\u0644\u0639\u0645\u0644\u064A\u0629", "danger")]
   ],
   resize_keyboard: true,
   is_persistent: true
 };
+var OWNER_FOOTER = [
+  [replyButton("\u21A9\uFE0F \u0631\u062C\u0648\u0639", "primary"), replyButton("\u{1F3E0} \u0627\u0644\u0631\u0626\u064A\u0633\u064A\u0629", "primary")]
+];
+var OWNER_KEYBOARD = {
+  keyboard: [
+    [replyButton("\u{1F680} \u062A\u0634\u063A\u064A\u0644 \u0627\u0644\u0628\u0648\u062A", "success")],
+    [replyButton("\u{1F4CA} \u0627\u0644\u0625\u062D\u0635\u0627\u0621\u0627\u062A", "success"), replyButton("\u{1F465} \u0625\u062F\u0627\u0631\u0629 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646", "primary")],
+    [replyButton("\u{1F512} \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643 \u0627\u0644\u0625\u062C\u0628\u0627\u0631\u064A", "primary"), replyButton("\u2699\uFE0F \u0627\u0644\u0625\u0639\u062F\u0627\u062F\u0627\u062A", "primary")],
+    [replyButton("\u{1F9F9} \u062A\u0646\u0638\u064A\u0641 \u0627\u0644\u0628\u064A\u0627\u0646\u0627\u062A", "danger"), replyButton("\u{1F4E3} \u0625\u0631\u0633\u0627\u0644 \u0644\u0644\u062C\u0645\u064A\u0639", "primary")],
+    [replyButton("\u{1F4CB} \u0623\u062E\u0637\u0627\u0621 \u062D\u062F\u064A\u062B\u0629", "primary"), replyButton("\u{1F6D1} \u0625\u0644\u063A\u0627\u0621 \u0627\u0644\u0639\u0645\u0644\u064A\u0629", "danger")]
+  ],
+  resize_keyboard: true,
+  is_persistent: true
+};
+var OWNER_USERS_KEYBOARD = {
+  keyboard: [
+    [replyButton("\u{1F465} \u0622\u062E\u0631 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646", "primary"), replyButton("\u2705 \u0627\u0644\u0646\u0634\u0637\u0648\u0646", "primary")],
+    [replyButton("\u{1F319} \u063A\u064A\u0631 \u0627\u0644\u0646\u0634\u0637\u064A\u0646", "primary"), replyButton("\u{1F6AB} \u0627\u0644\u0645\u062D\u0638\u0648\u0631\u0648\u0646", "primary")],
+    [replyButton("\u{1F6AB} \u062D\u0638\u0631 \u0645\u0633\u062A\u062E\u062F\u0645", "danger"), replyButton("\u2705 \u0641\u0643 \u0627\u0644\u062D\u0638\u0631", "success")],
+    ...OWNER_FOOTER
+  ],
+  resize_keyboard: true,
+  is_persistent: true
+};
+var OWNER_SETTINGS_KEYBOARD = {
+  keyboard: [
+    [replyButton("\u23F1\uFE0F \u0645\u062F\u0629 \u0627\u0644\u062A\u0646\u0638\u064A\u0641", "primary")],
+    ...OWNER_FOOTER
+  ],
+  resize_keyboard: true,
+  is_persistent: true
+};
+var OWNER_CLEANUP_KEYBOARD = {
+  keyboard: [
+    [replyButton("\u{1F9F9} \u062A\u0646\u0638\u064A\u0641 \u0627\u0644\u0622\u0646", "danger"), replyButton("\u23F1\uFE0F \u0645\u062F\u0629 \u0627\u0644\u062A\u0646\u0638\u064A\u0641", "primary")],
+    ...OWNER_FOOTER
+  ],
+  resize_keyboard: true,
+  is_persistent: true
+};
+var OWNER_SUBSCRIPTIONS_KEYBOARD = {
+  keyboard: [
+    [replyButton("\u2795 \u0625\u0636\u0627\u0641\u0629 \u0642\u0646\u0627\u0629/\u0628\u0648\u062A", "success"), replyButton("\u2796 \u0625\u0632\u0627\u0644\u0629 \u0642\u0646\u0627\u0629/\u0628\u0648\u062A", "danger")],
+    [replyButton("\u{1F4CB} \u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643", "primary")],
+    ...OWNER_FOOTER
+  ],
+  resize_keyboard: true,
+  is_persistent: true
+};
+function subscriptionGateText(missing) {
+  const items = missing.map((subscription, index2) => {
+    const kindLabel = subscription.kind === "group" ? "\u0645\u062C\u0645\u0648\u0639\u0629" : subscription.kind === "bot" ? "\u0628\u0648\u062A" : "\u0642\u0646\u0627\u0629";
+    const link = subscription.inviteUrl ? ` <a href="${escapeHtml(subscription.inviteUrl)}">@${escapeHtml(subscription.label.replace(/^@/, ""))}</a>` : ` <code>${escapeHtml(subscription.label)}</code>`;
+    return `${index2 + 1}. (${kindLabel})${link}`;
+  }).join("\n");
+  return `\u{1F512} <b>\u0627\u0634\u062A\u0631\u0627\u0643 \u0625\u062C\u0628\u0627\u0631\u064A</b>
+
+\u0644\u0644\u062D\u0635\u0648\u0644 \u0639\u0644\u0649 \u062E\u062F\u0645\u0629 \u0627\u0644\u062A\u0646\u0632\u064A\u0644 \u064A\u062C\u0628 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643 \u0623\u0648\u0644\u0627\u064B \u0641\u064A:
+
+${items}
+
+\u0627\u0636\u063A\u0637 \u0632\u0631 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643 \u062B\u0645 \u0632\u0631 <b>\xAB\u062A\u062D\u0642\u0642\u062A \u0645\u0646 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643\xBB</b>.`;
+}
+function subscriptionGateKeyboard(missing) {
+  const joinRows = missing.filter((subscription) => Boolean(subscription.inviteUrl)).map((subscription) => [{ text: `\u{1F517} \u0627\u0634\u062A\u0631\u0643 \u0627\u0644\u0622\u0646 \xB7 ${subscription.label}`, url: subscription.inviteUrl }]);
+  return {
+    inline_keyboard: [
+      ...joinRows,
+      [inlineButton("\u2705 \u062A\u062D\u0642\u0642\u062A \u0645\u0646 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643", "sub_check", "primary")]
+    ]
+  };
+}
 function inspectionText(result) {
   const duration = result.durationSeconds ? `
 \u0627\u0644\u0645\u062F\u0629 \u0627\u0644\u062A\u0642\u0631\u064A\u0628\u064A\u0629: <b>${Math.round(result.durationSeconds)} \u062B\u0627\u0646\u064A\u0629</b>` : "";
+  const imagesCount = result.imageCount && result.imageCount > 1 ? `
+\u{1F5BC} \u0639\u062F\u062F \u0627\u0644\u0635\u0648\u0631 \u0627\u0644\u0645\u062A\u0627\u062D\u0629: <b>${result.imageCount}</b>` : "";
   const platformLabels = {
     tiktok: "TikTok",
     instagram: "Instagram",
@@ -2314,7 +2739,7 @@ ${lines.join("\n")}`;
   return `\u2726 <b>\u062A\u0645 \u0641\u062D\u0635 \u0627\u0644\u0631\u0627\u0628\u0637</b>
 
 \u0627\u0644\u0645\u0646\u0635\u0629: <b>${platformLabels[result.platform]}</b>
-\u0627\u0644\u0639\u0646\u0648\u0627\u0646: <b>${escapeHtml(result.title)}</b>${duration}${accountBlock}
+\u0627\u0644\u0639\u0646\u0648\u0627\u0646: <b>${escapeHtml(result.title)}</b>${duration}${imagesCount}${accountBlock}
 
 \u0627\u062E\u062A\u0631 \u0646\u0648\u0639 \u0627\u0644\u0645\u0644\u0641 \u0627\u0644\u0645\u0646\u0627\u0633\u0628. \u0644\u0627 \u064A\u064F\u0639\u0631\u0636 \u0625\u0644\u0627 \u0645\u0627 \u0623\u0643\u062F\u0647 \u0627\u0644\u0641\u062D\u0635 \u0645\u0646 \u0647\u0630\u0627 \u0627\u0644\u0631\u0627\u0628\u0637 \u0627\u0644\u0639\u0627\u0645.`;
 }
@@ -2324,13 +2749,13 @@ var MEDIA_BUTTONS = {
   image: { text: "\u{1F5BC} \u062A\u0646\u0632\u064A\u0644 \u0635\u0648\u0631\u0629 \u0623\u0635\u0644\u064A\u0629", style: "primary", iconEnv: "BUTTON_CUSTOM_EMOJI_IMAGE" },
   story: { text: "\u{1F4D6} \u062A\u0646\u0632\u064A\u0644 \u0627\u0644\u0633\u062A\u0648\u0631\u064A", style: "success", iconEnv: "BUTTON_CUSTOM_EMOJI_STORY" }
 };
-function mediaChoiceKeyboard(jobId, choices) {
-  return {
-    inline_keyboard: [
-      ...choices.map((choice) => [inlineButton(MEDIA_BUTTONS[choice].text, `dl:${jobId}:${choice}`, MEDIA_BUTTONS[choice].style, MEDIA_BUTTONS[choice].iconEnv)]),
-      [inlineButton("\u2716\uFE0F \u0625\u0644\u063A\u0627\u0621 \u0627\u0644\u0639\u0645\u0644\u064A\u0629", `cancel:${jobId}`, "danger", "BUTTON_CUSTOM_EMOJI_CANCEL")]
-    ]
-  };
+function mediaChoiceKeyboard(jobId, choices, imageCount) {
+  const rows = choices.map((choice) => [inlineButton(MEDIA_BUTTONS[choice].text, `dl:${jobId}:${choice}`, MEDIA_BUTTONS[choice].style, MEDIA_BUTTONS[choice].iconEnv)]);
+  if (imageCount && imageCount > 1 && choices.includes("image")) {
+    rows.push([inlineButton(`\u{1F5BC} \u062A\u0646\u0632\u064A\u0644 \u0627\u0644\u0635\u0648\u0631 \u0643\u0627\u0645\u0644\u0629 (${imageCount})`, `dl:${jobId}:images`, "success", "BUTTON_CUSTOM_EMOJI_IMAGE")]);
+  }
+  rows.push([inlineButton("\u2716\uFE0F \u0625\u0644\u063A\u0627\u0621 \u0627\u0644\u0639\u0645\u0644\u064A\u0629", `cancel:${jobId}`, "danger", "BUTTON_CUSTOM_EMOJI_CANCEL")]);
+  return { inline_keyboard: rows };
 }
 function retryTikTokKeyboard(jobId) {
   return {
@@ -2342,6 +2767,7 @@ function retryTikTokKeyboard(jobId) {
 var recentRequests = /* @__PURE__ */ new Map();
 var pendingAdminInputs = /* @__PURE__ */ new Map();
 var pendingReports = /* @__PURE__ */ new Map();
+var ownerPageStacks = /* @__PURE__ */ new Map();
 var primaryOwnerEnsured = false;
 var legacyOwnerLabels = {
   "\u2705 \u0627\u0644\u062D\u0627\u0636\u0631\u0648\u0646": "\u2705 \u0627\u0644\u0646\u0634\u0637\u0648\u0646",
@@ -2350,29 +2776,32 @@ var legacyOwnerLabels = {
   "\u{1F4E3} \u0631\u0633\u0627\u0644\u0629 \u062C\u0645\u0627\u0639\u064A\u0629": "\u{1F4E3} \u0625\u0631\u0633\u0627\u0644 \u0644\u0644\u062C\u0645\u064A\u0639",
   "\u2699\uFE0F \u062D\u062F \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646": "\u2699\uFE0F \u0633\u0639\u0629 \u0627\u0644\u0628\u0648\u062A",
   "\u{1F5D3} \u0625\u0639\u062F\u0627\u062F \u0627\u0644\u062A\u0646\u0638\u064A\u0641": "\u23F1\uFE0F \u0645\u062F\u0629 \u0627\u0644\u062A\u0646\u0638\u064A\u0641",
-  "\u{1F9F9} \u062A\u0646\u0638\u064A\u0641 \u0627\u0644\u0628\u064A\u0627\u0646\u0627\u062A": "\u{1F9F9} \u062A\u0646\u0638\u064A\u0641 \u0627\u0644\u0622\u0646",
-  "\u{1F4CB} \u0633\u062C\u0644\u0627\u062A \u0627\u0644\u0623\u062E\u0637\u0627\u0621": "\u{1F4CB} \u0623\u062E\u0637\u0627\u0621 \u062D\u062F\u064A\u062B\u0629",
-  "\u{1F4E6} \u0646\u0633\u062E\u0629 \u0627\u0644\u0645\u0634\u0631\u0648\u0639": "\u{1F4E6} \u062A\u062D\u0645\u064A\u0644 \u0646\u0633\u062E\u0629 \u0627\u0644\u0645\u0634\u0631\u0648\u0639"
+  "\u{1F9F9} \u062A\u0646\u0638\u064A\u0641 \u0627\u0644\u0628\u064A\u0627\u0646\u0627\u062A": "\u{1F9F9} \u062A\u0646\u0638\u064A\u0641 \u0627\u0644\u0628\u064A\u0627\u0646\u0627\u062A",
+  "\u{1F4CB} \u0633\u062C\u0644\u0627\u062A \u0627\u0644\u0623\u062E\u0637\u0627\u0621": "\u{1F4CB} \u0623\u062E\u0637\u0627\u0621 \u062D\u062F\u064A\u062B\u0629"
 };
 var ownerControlLabels = /* @__PURE__ */ new Set([
   "\u{1F4CA} \u0627\u0644\u0625\u062D\u0635\u0627\u0621\u0627\u062A",
+  "\u{1F465} \u0625\u062F\u0627\u0631\u0629 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646",
   "\u{1F465} \u0622\u062E\u0631 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646",
   "\u2705 \u0627\u0644\u0646\u0634\u0637\u0648\u0646",
   "\u{1F319} \u063A\u064A\u0631 \u0627\u0644\u0646\u0634\u0637\u064A\u0646",
   "\u{1F6AB} \u0627\u0644\u0645\u062D\u0638\u0648\u0631\u0648\u0646",
-  "\u{1F9F9} \u062A\u0646\u0638\u064A\u0641 \u0627\u0644\u0622\u0646",
-  "\u{1F4CB} \u0623\u062E\u0637\u0627\u0621 \u062D\u062F\u064A\u062B\u0629",
-  "\u{1F451} \u0627\u0644\u0645\u0644\u0627\u0643",
-  "\u{1F6D1} \u0625\u0644\u063A\u0627\u0621 \u0627\u0644\u0639\u0645\u0644\u064A\u0629",
-  "\u21A9\uFE0F \u0625\u0644\u063A\u0627\u0621 \u0627\u0644\u0625\u062F\u062E\u0627\u0644",
   "\u{1F6AB} \u062D\u0638\u0631 \u0645\u0633\u062A\u062E\u062F\u0645",
   "\u2705 \u0641\u0643 \u0627\u0644\u062D\u0638\u0631",
-  "\u2699\uFE0F \u0633\u0639\u0629 \u0627\u0644\u0628\u0648\u062A",
+  "\u{1F512} \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643 \u0627\u0644\u0625\u062C\u0628\u0627\u0631\u064A",
+  "\u2795 \u0625\u0636\u0627\u0641\u0629 \u0642\u0646\u0627\u0629/\u0628\u0648\u062A",
+  "\u2796 \u0625\u0632\u0627\u0644\u0629 \u0642\u0646\u0627\u0629/\u0628\u0648\u062A",
+  "\u{1F4CB} \u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",
+  "\u2699\uFE0F \u0627\u0644\u0625\u0639\u062F\u0627\u062F\u0627\u062A",
   "\u23F1\uFE0F \u0645\u062F\u0629 \u0627\u0644\u062A\u0646\u0638\u064A\u0641",
+  "\u{1F9F9} \u062A\u0646\u0638\u064A\u0641 \u0627\u0644\u0628\u064A\u0627\u0646\u0627\u062A",
+  "\u{1F9F9} \u062A\u0646\u0638\u064A\u0641 \u0627\u0644\u0622\u0646",
   "\u{1F4E3} \u0625\u0631\u0633\u0627\u0644 \u0644\u0644\u062C\u0645\u064A\u0639",
-  "\u2795 \u0625\u0636\u0627\u0641\u0629 \u0645\u0627\u0644\u0643",
-  "\u2796 \u062D\u0630\u0641 \u0645\u0627\u0644\u0643",
-  "\u{1F4E6} \u062A\u062D\u0645\u064A\u0644 \u0646\u0633\u062E\u0629 \u0627\u0644\u0645\u0634\u0631\u0648\u0639",
+  "\u{1F4CB} \u0623\u062E\u0637\u0627\u0621 \u062D\u062F\u064A\u062B\u0629",
+  "\u21A9\uFE0F \u0631\u062C\u0648\u0639",
+  "\u{1F3E0} \u0627\u0644\u0631\u0626\u064A\u0633\u064A\u0629",
+  "\u{1F6D1} \u0625\u0644\u063A\u0627\u0621 \u0627\u0644\u0639\u0645\u0644\u064A\u0629",
+  "\u21A9\uFE0F \u0625\u0644\u063A\u0627\u0621 \u0627\u0644\u0625\u062F\u062E\u0627\u0644",
   "/admin"
 ]);
 function allowRequest(telegramId) {
@@ -2429,6 +2858,22 @@ function isRetryableTikTokFailure(error, platform) {
 }
 function beginAdminInput(telegramId, action) {
   pendingAdminInputs.set(telegramId, { action, expiresAt: Date.now() + 10 * 6e4 });
+}
+function ownerStack(telegramId) {
+  let stack = ownerPageStacks.get(telegramId);
+  if (!stack) {
+    stack = ["main"];
+    ownerPageStacks.set(telegramId, stack);
+  }
+  return stack;
+}
+function ownerKeyboardFor(telegramId) {
+  const current = ownerStack(telegramId)[ownerStack(telegramId).length - 1];
+  if (current === "users") return OWNER_USERS_KEYBOARD;
+  if (current === "settings") return OWNER_SETTINGS_KEYBOARD;
+  if (current === "subscriptions") return OWNER_SUBSCRIPTIONS_KEYBOARD;
+  if (current === "cleanup") return OWNER_CLEANUP_KEYBOARD;
+  return OWNER_KEYBOARD;
 }
 function normalizeOwnerLabel(text2) {
   return legacyOwnerLabels[text2] || text2;
@@ -2488,10 +2933,6 @@ async function admitMessage(message) {
     await sendMessage(String(message.chat.id), "\u0639\u0630\u0631\u0627\u064B\u060C \u0644\u0627 \u064A\u0645\u0643\u0646\u0643 \u0627\u0633\u062A\u062E\u062F\u0627\u0645 \u0647\u0630\u0627 \u0627\u0644\u0628\u0648\u062A \u062D\u0627\u0644\u064A\u0627\u064B.");
     return { admitted: false, primary: false };
   }
-  if (admission.admission === "capacity") {
-    await sendMessage(String(message.chat.id), "\u0639\u0630\u0631\u0627\u064B\u060C \u0648\u0635\u0644 \u0627\u0644\u0628\u0648\u062A \u0625\u0644\u0649 \u0627\u0644\u062D\u062F \u0627\u0644\u0623\u0642\u0635\u0649. \u062D\u0627\u0648\u0644 \u0644\u0627\u062D\u0642\u0627\u064B \u0628\u0639\u062F \u0627\u0644\u062A\u0646\u0638\u064A\u0641 \u0627\u0644\u062A\u0644\u0642\u0627\u0626\u064A.");
-    return { admitted: false, primary: false };
-  }
   const primary = await isPrimaryOwner(telegramId);
   if (admission.isNew) {
     await notifyOwners(`\u{1F464} <b>\u0645\u0633\u062A\u062E\u062F\u0645 \u062C\u062F\u064A\u062F</b>
@@ -2500,6 +2941,23 @@ async function admitMessage(message) {
 \u0627\u0644\u0645\u0639\u0631\u0641: @${escapeHtml(message.from.username)}` : ""}`);
   }
   return { admitted: true, primary };
+}
+async function checkForcedSubscriptions(telegramId) {
+  const subscriptions = await listForcedSubscriptions();
+  if (!subscriptions.length) return [];
+  const missing = [];
+  for (const subscription of subscriptions) {
+    if (subscription.kind === "bot") continue;
+    let member = false;
+    try {
+      const chatMember = await getChatMember(subscription.target, telegramId);
+      member = ["creator", "administrator", "member"].includes(chatMember.status || "");
+    } catch {
+      member = false;
+    }
+    if (!member) missing.push(subscription);
+  }
+  return missing;
 }
 async function inspectIncomingLink(message, rawUrl, primary) {
   const telegramId = String(message.from.id);
@@ -2517,7 +2975,7 @@ async function inspectIncomingLink(message, rawUrl, primary) {
     const job = await getMediaJob(jobId);
     if (!job || job.cancelRequested) return;
     await updateMediaJob(jobId, { status: "ready", choicesJson: JSON.stringify(result.choices) });
-    await sendMessage(chatId, inspectionText(result), { replyMarkup: mediaChoiceKeyboard(jobId, result.choices) });
+    await sendMessage(chatId, inspectionText(result), { replyMarkup: mediaChoiceKeyboard(jobId, result.choices, result.imageCount) });
   } catch (error) {
     if (error instanceof DownloaderError && error.message === "\u062A\u0645 \u0625\u0644\u063A\u0627\u0621 \u0627\u0644\u0639\u0645\u0644\u064A\u0629 \u0628\u0646\u062C\u0627\u062D.") return;
     const retryableTikTok = isRetryableTikTokFailure(error, platform);
@@ -2534,28 +2992,75 @@ async function inspectIncomingLink(message, rawUrl, primary) {
 function formatStats(stats) {
   return `\u{1F4CA} <b>\u0625\u062D\u0635\u0627\u0621\u0627\u062A \u0633\u0631\u064A\u0639\u0629</b>
 
-\u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u0648\u0646: <b>${stats.total}</b> / ${stats.settings.maxUsers}
+\u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u0648\u0646: <b>${stats.total}</b>
 \u0627\u0644\u0646\u0634\u0637\u0648\u0646 \u0627\u0644\u064A\u0648\u0645: <b>${stats.activeToday}</b>
 \u0627\u0644\u062C\u062F\u062F \u0627\u0644\u064A\u0648\u0645: <b>${stats.joinedToday}</b>
 \u0627\u0644\u0645\u062D\u0638\u0648\u0631\u0648\u0646: <b>${stats.blocked}</b>
 \u063A\u064A\u0631 \u0627\u0644\u0646\u0634\u0637\u064A\u0646: <b>${stats.inactive}</b>
 \u0627\u0644\u062A\u0646\u0638\u064A\u0641 \u0628\u0639\u062F: <b>${stats.settings.cleanupInactiveDays} \u064A\u0648\u0645\u0627\u064B</b>`;
 }
-async function sendAdminPanel(chatId) {
-  await sendMessage(chatId, "\u{1F451} <b>\u0644\u0648\u062D\u0629 \u0627\u0644\u0645\u0627\u0644\u0643 \u0627\u0644\u0623\u0633\u0627\u0633\u064A\u0629</b>\n\u0627\u062E\u062A\u0631 \u0648\u0638\u064A\u0641\u0629 \u0645\u0646 \u0627\u0644\u0623\u0632\u0631\u0627\u0631. \u0639\u0646\u062F \u0627\u0644\u062D\u0627\u062C\u0629 \u0644\u0631\u0642\u0645 \u0623\u0648 \u0646\u0635 \u0633\u0623\u0637\u0644\u0628\u0647 \u0645\u0646\u0643 \u0641\u064A \u0631\u0633\u0627\u0644\u0629 \u0645\u0646\u0641\u0635\u0644\u0629\u061B \u0644\u0627 \u062A\u062D\u062A\u0627\u062C \u0625\u0644\u0649 \u062D\u0641\u0638 \u0627\u0644\u0623\u0648\u0627\u0645\u0631.", { replyMarkup: OWNER_KEYBOARD });
+async function sendAdminPanel(chatId, telegramId) {
+  ownerStack(telegramId).length = 0;
+  ownerStack(telegramId).push("main");
+  await sendMessage(chatId, "\u{1F451} <b>\u0644\u0648\u062D\u0629 \u0627\u0644\u0645\u0627\u0644\u0643 \u0627\u0644\u0623\u0633\u0627\u0633\u064A\u0629</b>\n\u0627\u062E\u062A\u0631 \u0648\u0638\u064A\u0641\u0629 \u0645\u0646 \u0627\u0644\u0623\u0632\u0631\u0627\u0631. \u0639\u0646\u062F \u0627\u0644\u062D\u0627\u062C\u0629 \u0644\u0631\u0642\u0645 \u0623\u0648 \u0646\u0635 \u0633\u0623\u0637\u0644\u0628\u0647 \u0645\u0646\u0643 \u0641\u064A \u0631\u0633\u0627\u0644\u0629 \u0645\u0646\u0641\u0635\u0644\u0629.", { replyMarkup: OWNER_KEYBOARD });
 }
-async function sendUserList(chatId, title, users2) {
-  if (!users2.length) return sendMessage(chatId, `\u0644\u0627 \u062A\u0648\u062C\u062F \u0646\u062A\u0627\u0626\u062C \u0641\u064A \u0642\u0627\u0626\u0645\u0629 \xAB${title}\xBB.`, { replyMarkup: OWNER_KEYBOARD });
+async function sendUserList(chatId, title, users2, replyMarkup) {
+  if (!users2.length) return sendMessage(chatId, `\u0644\u0627 \u062A\u0648\u062C\u062F \u0646\u062A\u0627\u0626\u062C \u0641\u064A \u0642\u0627\u0626\u0645\u0629 \xAB${title}\xBB.`, { replyMarkup });
   const lines = users2.map((user, index2) => `${index2 + 1}. <b>${escapeHtml(user.displayName)}</b>${user.username ? ` (@${escapeHtml(user.username)})` : ""}
 <code>${user.telegramId}</code> \u2014 ${user.status === "blocked" ? "\u0645\u062D\u0638\u0648\u0631" : "\u0646\u0634\u0637"}`);
   return sendMessage(chatId, `\u{1F465} <b>${title}</b>
 
-${lines.join("\n")}`, { replyMarkup: OWNER_KEYBOARD });
+${lines.join("\n")}`, { replyMarkup });
+}
+function pendingInputPrompt(action) {
+  const prompts = {
+    ban: "\u0623\u0631\u0633\u0644 \u0627\u0644\u0622\u0646 \u0631\u0642\u0645 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645 \u0623\u0648 @username \u0644\u062D\u0638\u0631\u0647.",
+    unban: "\u0623\u0631\u0633\u0644 \u0627\u0644\u0622\u0646 \u0631\u0642\u0645 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645 \u0623\u0648 @username \u0644\u0641\u0643 \u0627\u0644\u062D\u0638\u0631.",
+    cleanup: "\u0623\u0631\u0633\u0644 \u0639\u062F\u062F \u0627\u0644\u0623\u064A\u0627\u0645 \u0642\u0628\u0644 \u062A\u0646\u0638\u064A\u0641 \u063A\u064A\u0631 \u0627\u0644\u0646\u0634\u0637\u064A\u0646\u060C \u0645\u0646 7 \u0625\u0644\u0649 365.",
+    broadcast: "\u0623\u0631\u0633\u0644 \u0627\u0644\u0622\u0646 \u0646\u0635 \u0627\u0644\u0631\u0633\u0627\u0644\u0629. \u0633\u062A\u0635\u0644 \u0644\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646 \u0627\u0644\u0646\u0634\u0637\u064A\u0646 \u0641\u0642\u0637.",
+    addChannel: "\u0623\u0631\u0633\u0644 \u0645\u0639\u0631\u0641 \u0627\u0644\u0642\u0646\u0627\u0629 \u0623\u0648 \u0627\u0644\u0645\u062C\u0645\u0648\u0639\u0629 \u0623\u0648 \u0627\u0644\u0628\u0648\u062A:\n- @username\n- \u0623\u0648 \u0631\u0642\u0645 \u0627\u0644\u0642\u0646\u0627\u0629\n- \u0623\u0648 \u0631\u0627\u0628\u0637 t.me/username",
+    removeChannel: "\u0623\u0631\u0633\u0644 \u0645\u0639\u0631\u0641 \u0627\u0644\u0642\u0646\u0627\u0629 \u0623\u0648 @username \u0623\u0648 \u0645\u0639\u0631\u0651\u0641\u0647\u0627 \u0645\u0646 \u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643."
+  };
+  return prompts[action];
 }
 async function handleOwnerButton(message, text2) {
   const chatId = String(message.chat.id);
   const telegramId = String(message.from.id);
   text2 = normalizeOwnerLabel(text2);
+  const replyMarkup = ownerKeyboardFor(telegramId);
+  if (text2 === "\u21A9\uFE0F \u0631\u062C\u0648\u0639") {
+    const stack = ownerStack(telegramId);
+    if (stack.length > 1) stack.pop();
+    await sendMessage(chatId, "\u21A9\uFE0F <b>\u0631\u062C\u0648\u0639</b>", { replyMarkup: ownerKeyboardFor(telegramId) });
+    return true;
+  }
+  if (text2 === "\u{1F3E0} \u0627\u0644\u0631\u0626\u064A\u0633\u064A\u0629") {
+    const stack = ownerStack(telegramId);
+    stack.length = 0;
+    stack.push("main");
+    await sendMessage(chatId, "\u{1F3E0} <b>\u0627\u0644\u0631\u0626\u064A\u0633\u064A\u0629</b>", { replyMarkup: OWNER_KEYBOARD });
+    return true;
+  }
+  if (text2 === "\u{1F465} \u0625\u062F\u0627\u0631\u0629 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646") {
+    ownerStack(telegramId).push("users");
+    await sendMessage(chatId, "\u{1F465} <b>\u0625\u062F\u0627\u0631\u0629 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646</b>\n\u0627\u0644\u0642\u0648\u0627\u0626\u0645\u060C \u0627\u0644\u062D\u0638\u0631\u060C \u0648\u0641\u0643 \u0627\u0644\u062D\u0638\u0631.", { replyMarkup: OWNER_USERS_KEYBOARD });
+    return true;
+  }
+  if (text2 === "\u{1F512} \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643 \u0627\u0644\u0625\u062C\u0628\u0627\u0631\u064A") {
+    ownerStack(telegramId).push("subscriptions");
+    await sendMessage(chatId, "\u{1F512} <b>\u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643 \u0627\u0644\u0625\u062C\u0628\u0627\u0631\u064A</b>\n\u0623\u0636\u0641 \u0627\u0644\u0642\u0646\u0648\u0627\u062A \u0623\u0648 \u0627\u0644\u0645\u062C\u0645\u0648\u0639\u0627\u062A \u0623\u0648 \u0627\u0644\u0628\u0648\u062A\u0627\u062A \u0627\u0644\u0645\u0637\u0644\u0648\u0628\u0629 \u0642\u0628\u0644 \u0627\u0633\u062A\u062E\u062F\u0627\u0645 \u0627\u0644\u0628\u0648\u062A. \u0645\u0644\u0643\u064A\u0629 \u0627\u0644\u0639\u0636\u0648\u064A\u0629 \u062A\u064F\u0641\u062D\u0635 \u062A\u0644\u0642\u0627\u0626\u064A\u0627\u064B \u0642\u0628\u0644 \u062A\u0646\u0632\u064A\u0644 \u0623\u064A \u0631\u0627\u0628\u0637.", { replyMarkup: OWNER_SUBSCRIPTIONS_KEYBOARD });
+    return true;
+  }
+  if (text2 === "\u2699\uFE0F \u0627\u0644\u0625\u0639\u062F\u0627\u062F\u0627\u062A") {
+    ownerStack(telegramId).push("settings");
+    await sendMessage(chatId, "\u2699\uFE0F <b>\u0627\u0644\u0625\u0639\u062F\u0627\u062F\u0627\u062A</b>", { replyMarkup: OWNER_SETTINGS_KEYBOARD });
+    return true;
+  }
+  if (text2 === "\u{1F9F9} \u062A\u0646\u0638\u064A\u0641 \u0627\u0644\u0628\u064A\u0627\u0646\u0627\u062A") {
+    ownerStack(telegramId).push("cleanup");
+    await sendMessage(chatId, "\u{1F9F9} <b>\u062A\u0646\u0638\u064A\u0641 \u0627\u0644\u0628\u064A\u0627\u0646\u0627\u062A</b>", { replyMarkup: OWNER_CLEANUP_KEYBOARD });
+    return true;
+  }
   if (text2 === "\u{1F4CA} \u0627\u0644\u0625\u062D\u0635\u0627\u0621\u0627\u062A") {
     const { botStats: botStats2 } = await Promise.resolve().then(() => (init_botDb(), botDb_exports));
     await sendMessage(chatId, formatStats(await botStats2()), { replyMarkup: OWNER_KEYBOARD });
@@ -2563,28 +3068,28 @@ async function handleOwnerButton(message, text2) {
   }
   if (text2 === "\u{1F465} \u0622\u062E\u0631 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646") {
     const { listTelegramUsers: listTelegramUsers2 } = await Promise.resolve().then(() => (init_botDb(), botDb_exports));
-    await sendUserList(chatId, "\u0622\u062E\u0631 50 \u0645\u0633\u062A\u062E\u062F\u0645\u0627\u064B", await listTelegramUsers2("recent"));
+    await sendUserList(chatId, "\u0622\u062E\u0631 50 \u0645\u0633\u062A\u062E\u062F\u0645\u0627\u064B", await listTelegramUsers2("recent"), replyMarkup);
     return true;
   }
   if (text2 === "\u2705 \u0627\u0644\u0646\u0634\u0637\u0648\u0646") {
     const { listTelegramUsers: listTelegramUsers2 } = await Promise.resolve().then(() => (init_botDb(), botDb_exports));
-    await sendUserList(chatId, "\u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u0648\u0646 \u0627\u0644\u0646\u0634\u0637\u0648\u0646", await listTelegramUsers2("active"));
+    await sendUserList(chatId, "\u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u0648\u0646 \u0627\u0644\u0646\u0634\u0637\u0648\u0646", await listTelegramUsers2("active"), replyMarkup);
     return true;
   }
   if (text2 === "\u{1F319} \u063A\u064A\u0631 \u0627\u0644\u0646\u0634\u0637\u064A\u0646") {
     const { listTelegramUsers: listTelegramUsers2 } = await Promise.resolve().then(() => (init_botDb(), botDb_exports));
-    await sendUserList(chatId, "\u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u0648\u0646 \u063A\u064A\u0631 \u0627\u0644\u0646\u0634\u0637\u064A\u0646", await listTelegramUsers2("inactive"));
+    await sendUserList(chatId, "\u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u0648\u0646 \u063A\u064A\u0631 \u0627\u0644\u0646\u0634\u0637\u064A\u0646", await listTelegramUsers2("inactive"), replyMarkup);
     return true;
   }
   if (text2 === "\u{1F6AB} \u0627\u0644\u0645\u062D\u0638\u0648\u0631\u0648\u0646") {
     const { listTelegramUsers: listTelegramUsers2 } = await Promise.resolve().then(() => (init_botDb(), botDb_exports));
-    await sendUserList(chatId, "\u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u0648\u0646 \u0627\u0644\u0645\u062D\u0638\u0648\u0631\u0648\u0646", await listTelegramUsers2("blocked"));
+    await sendUserList(chatId, "\u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u0648\u0646 \u0627\u0644\u0645\u062D\u0638\u0648\u0631\u0648\u0646", await listTelegramUsers2("blocked"), replyMarkup);
     return true;
   }
   if (text2 === "\u{1F9F9} \u062A\u0646\u0638\u064A\u0641 \u0627\u0644\u0622\u0646") {
     const { cleanupBotData: cleanupBotData2 } = await Promise.resolve().then(() => (init_botDb(), botDb_exports));
     const result = await cleanupBotData2();
-    await sendMessage(chatId, `\u062A\u0645 \u0627\u0644\u062A\u0646\u0638\u064A\u0641. \u0623\u0632\u064A\u0644\u062A \u0633\u062C\u0644\u0627\u062A <b>${result.removedInactiveUsers}</b> \u0645\u0633\u062A\u062E\u062F\u0645 \u063A\u064A\u0631 \u0646\u0634\u0637 \u0648\u0627\u0644\u0639\u0645\u0644\u064A\u0627\u062A \u0627\u0644\u0645\u0624\u0642\u062A\u0629 \u0627\u0644\u0645\u0646\u062A\u0647\u064A\u0629.`, { replyMarkup: OWNER_KEYBOARD });
+    await sendMessage(chatId, `\u062A\u0645 \u0627\u0644\u062A\u0646\u0638\u064A\u0641. \u0623\u0632\u064A\u0644\u062A \u0633\u062C\u0644\u0627\u062A <b>${result.removedInactiveUsers}</b> \u0645\u0633\u062A\u062E\u062F\u0645 \u063A\u064A\u0631 \u0646\u0634\u0637 \u0648\u0627\u0644\u0639\u0645\u0644\u064A\u0627\u062A \u0627\u0644\u0645\u0624\u0642\u062A\u0629 \u0627\u0644\u0645\u0646\u062A\u0647\u064A\u0629.`, { replyMarkup });
     return true;
   }
   if (text2 === "\u{1F4CB} \u0623\u062E\u0637\u0627\u0621 \u062D\u062F\u064A\u062B\u0629") {
@@ -2596,53 +3101,50 @@ ${errors.map((error) => `\u2022 <b>${escapeHtml(error.stage)}</b> \u2014 <code>$
 ${escapeHtml(error.message.slice(0, 160))}`).join("\n\n")}` : "\u0644\u0627 \u062A\u0648\u062C\u062F \u0623\u062E\u0637\u0627\u0621 \u0645\u0633\u062C\u0644\u0629 \u062D\u0627\u0644\u064A\u0627\u064B.", { replyMarkup: OWNER_KEYBOARD });
     return true;
   }
-  if (text2 === "\u{1F451} \u0627\u0644\u0645\u0644\u0627\u0643") {
-    const { listOwners: listOwners2 } = await Promise.resolve().then(() => (init_botDb(), botDb_exports));
-    const owners = await listOwners2();
-    await sendMessage(chatId, `\u{1F451} <b>\u0627\u0644\u0645\u0644\u0627\u0643 \u0648\u0627\u0644\u062A\u0646\u0628\u064A\u0647\u0627\u062A</b>
-${owners.map((owner) => `\u2022 <code>${owner.telegramId}</code> \u2014 ${owner.role === "primary" ? "\u0627\u0644\u0645\u0627\u0644\u0643 \u0627\u0644\u0623\u0633\u0627\u0633\u064A" : "\u064A\u062A\u0644\u0642\u0649 \u0627\u0644\u062A\u0646\u0628\u064A\u0647\u0627\u062A"}`).join("\n")}`, { replyMarkup: OWNER_KEYBOARD });
+  if (text2 === "\u{1F4CB} \u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643") {
+    const subscriptions = await listForcedSubscriptions();
+    if (!subscriptions.length) {
+      await sendMessage(chatId, "\u0644\u0627 \u062A\u0648\u062C\u062F \u0642\u0646\u0648\u0627\u062A \u0627\u0634\u062A\u0631\u0627\u0643 \u0645\u0641\u0631\u0648\u0636\u0629 \u062D\u0627\u0644\u064A\u0627\u064B.", { replyMarkup: OWNER_SUBSCRIPTIONS_KEYBOARD });
+      return true;
+    }
+    const lines = subscriptions.map((subscription, index2) => {
+      const kindLabel = subscription.kind === "group" ? "\u0645\u062C\u0645\u0648\u0639\u0629" : subscription.kind === "bot" ? "\u0628\u0648\u062A" : "\u0642\u0646\u0627\u0629";
+      const link = subscription.inviteUrl ? `<a href="${escapeHtml(subscription.inviteUrl)}">${escapeHtml(subscription.label)}</a>` : `<code>${escapeHtml(subscription.label)}</code>`;
+      return `${index2 + 1}. (${kindLabel}) ${link}
+   <code>${escapeHtml(subscription.target)}</code>`;
+    }).join("\n");
+    const note = subscriptions.some((subscription) => subscription.kind === "bot") ? "\n\n\u2139\uFE0F \u0644\u0627 \u062A\u0648\u062C\u062F \u0648\u0627\u062C\u0647\u0629 \u0639\u0627\u0645\u0629 \u0644\u0644\u062A\u062D\u0642\u0642 \u0645\u0646 \u0628\u062F\u0621 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645 \u0644\u0628\u0648\u062A\u061B \u064A\u064F\u0639\u062A\u0628\u0631 \u0627\u0634\u062A\u0631\u0627\u0643 \u0627\u0644\u0628\u0648\u062A \u0645\u0643\u062A\u0645\u0644\u0627\u064B \u062F\u0627\u0626\u0645\u0627\u064B." : "";
+    await sendMessage(chatId, `\u{1F512} <b>\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643 \u0627\u0644\u0625\u062C\u0628\u0627\u0631\u064A (${subscriptions.length})</b>
+
+${lines}${note}
+
+\u0644\u0644\u0625\u0632\u0627\u0644\u0629 \u0627\u0636\u063A\u0637 \xAB\u0625\u0632\u0627\u0644\u0629 \u0642\u0646\u0627\u0629/\u0628\u0648\u062A\xBB \u0648\u0623\u0631\u0633\u0644 \u0646\u0641\u0633 \u0627\u0644\u0645\u0639\u0631\u0651\u0641.`, { replyMarkup: OWNER_SUBSCRIPTIONS_KEYBOARD });
     return true;
   }
   if (text2 === "\u{1F6D1} \u0625\u0644\u063A\u0627\u0621 \u0627\u0644\u0639\u0645\u0644\u064A\u0629") {
     const { cancelLatestActiveJob: cancelLatestActiveJob2 } = await Promise.resolve().then(() => (init_botDb(), botDb_exports));
     const cancelled = await cancelLatestActiveJob2(telegramId);
     if (cancelled) abortYtDlp(cancelled);
-    await sendMessage(chatId, cancelled ? "\u062A\u0645 \u0625\u0644\u063A\u0627\u0621 \u0622\u062E\u0631 \u0639\u0645\u0644\u064A\u0629 \u0646\u0634\u0637\u0629." : "\u0644\u0627 \u062A\u0648\u062C\u062F \u0639\u0645\u0644\u064A\u0629 \u0642\u0627\u0628\u0644\u0629 \u0644\u0644\u0625\u0644\u063A\u0627\u0621.", { replyMarkup: OWNER_KEYBOARD });
-    return true;
-  }
-  if (text2 === "\u{1F4E6} \u062A\u062D\u0645\u064A\u0644 \u0646\u0633\u062E\u0629 \u0627\u0644\u0645\u0634\u0631\u0648\u0639") {
-    let archive;
-    await sendMessage(chatId, "\u{1F4E6} \u062C\u0627\u0631\u064D \u062A\u062C\u0647\u064A\u0632 \u0646\u0633\u062E\u0629 \u0627\u0644\u0645\u0634\u0631\u0648\u0639 \u0627\u0644\u0622\u0645\u0646\u0629. \u0644\u0627 \u062A\u062A\u0636\u0645\u0646 \u0647\u0630\u0647 \u0627\u0644\u0646\u0633\u062E\u0629 \u0623\u064A \u062A\u0648\u0643\u0646 \u0623\u0648 \u0633\u0631 \u0623\u0648 \u0645\u0644\u0641 \u0645\u0624\u0642\u062A\u2026", { replyMarkup: OWNER_KEYBOARD });
-    try {
-      archive = await createProjectArchive();
-      await sendProjectArchive(chatId, archive.archivePath, `\u{1F4E6} <b>\u0646\u0633\u062E\u0629 \u0645\u0634\u0631\u0648\u0639 \u0627\u0644\u0628\u0648\u062A</b>
-\u0627\u0644\u062D\u062C\u0645: <b>${Math.round(archive.bytes / 1024)} KB</b>
-\u0644\u0627 \u062A\u062A\u0636\u0645\u0646 \u0627\u0644\u0646\u0633\u062E\u0629 \u0627\u0644\u0623\u0633\u0631\u0627\u0631 \u0623\u0648 \u0645\u0644\u0641\u0627\u062A \u0627\u0644\u0648\u0633\u0627\u0626\u0637 \u0627\u0644\u0645\u0624\u0642\u062A\u0629.`);
-    } catch (error) {
-      await sendMessage(chatId, `\u062A\u0639\u0630\u0631 \u0625\u0646\u0634\u0627\u0621 \u0627\u0644\u0646\u0633\u062E\u0629: <b>${escapeHtml(error instanceof Error ? error.message : "\u062E\u0637\u0623 \u063A\u064A\u0631 \u0645\u062A\u0648\u0642\u0639")}</b>`, { replyMarkup: OWNER_KEYBOARD });
-    } finally {
-      if (archive) await purgeProjectArchive(archive.workdir);
-    }
+    await sendMessage(chatId, cancelled ? "\u062A\u0645 \u0625\u0644\u063A\u0627\u0621 \u0622\u062E\u0631 \u0639\u0645\u0644\u064A\u0629 \u0646\u0634\u0637\u0629." : "\u0644\u0627 \u062A\u0648\u062C\u062F \u0639\u0645\u0644\u064A\u0629 \u0642\u0627\u0628\u0644\u0629 \u0644\u0644\u0625\u0644\u063A\u0627\u0621.", { replyMarkup: keyboardFor(true) });
     return true;
   }
   const inputs = {
-    "\u{1F6AB} \u062D\u0638\u0631 \u0645\u0633\u062A\u062E\u062F\u0645": { action: "ban", prompt: "\u0623\u0631\u0633\u0644 \u0627\u0644\u0622\u0646 \u0631\u0642\u0645 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645 \u0623\u0648 @username \u0644\u062D\u0638\u0631\u0647." },
-    "\u2705 \u0641\u0643 \u0627\u0644\u062D\u0638\u0631": { action: "unban", prompt: "\u0623\u0631\u0633\u0644 \u0627\u0644\u0622\u0646 \u0631\u0642\u0645 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645 \u0623\u0648 @username \u0644\u0641\u0643 \u0627\u0644\u062D\u0638\u0631." },
-    "\u2699\uFE0F \u0633\u0639\u0629 \u0627\u0644\u0628\u0648\u062A": { action: "limit", prompt: "\u0623\u0631\u0633\u0644 \u0627\u0644\u0639\u062F\u062F \u0627\u0644\u062C\u062F\u064A\u062F \u0644\u0644\u0633\u0639\u0629\u060C \u0645\u062B\u0644: 100" },
-    "\u23F1\uFE0F \u0645\u062F\u0629 \u0627\u0644\u062A\u0646\u0638\u064A\u0641": { action: "cleanup", prompt: "\u0623\u0631\u0633\u0644 \u0639\u062F\u062F \u0627\u0644\u0623\u064A\u0627\u0645 \u0642\u0628\u0644 \u062A\u0646\u0638\u064A\u0641 \u063A\u064A\u0631 \u0627\u0644\u0646\u0634\u0637\u064A\u0646\u060C \u0645\u0646 7 \u0625\u0644\u0649 365." },
-    "\u{1F4E3} \u0625\u0631\u0633\u0627\u0644 \u0644\u0644\u062C\u0645\u064A\u0639": { action: "broadcast", prompt: "\u0623\u0631\u0633\u0644 \u0627\u0644\u0622\u0646 \u0646\u0635 \u0627\u0644\u0631\u0633\u0627\u0644\u0629. \u0633\u062A\u0635\u0644 \u0644\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646 \u0627\u0644\u0646\u0634\u0637\u064A\u0646 \u0641\u0642\u0637." },
-    "\u2795 \u0625\u0636\u0627\u0641\u0629 \u0645\u0627\u0644\u0643": { action: "addOwner", prompt: "\u0623\u0631\u0633\u0644 \u0627\u0644\u0645\u0639\u0631\u0651\u0641 \u0627\u0644\u0631\u0642\u0645\u064A \u0644\u0644\u0645\u0627\u0644\u0643 \u0627\u0644\u0630\u064A \u0633\u064A\u0633\u062A\u0644\u0645 \u0627\u0644\u062A\u0646\u0628\u064A\u0647\u0627\u062A." },
-    "\u2796 \u062D\u0630\u0641 \u0645\u0627\u0644\u0643": { action: "removeOwner", prompt: "\u0623\u0631\u0633\u0644 \u0627\u0644\u0645\u0639\u0631\u0651\u0641 \u0627\u0644\u0631\u0642\u0645\u064A \u0644\u0644\u0645\u0627\u0644\u0643 \u0627\u0644\u0645\u0631\u0627\u062F \u062D\u0630\u0641\u0647 \u0645\u0646 \u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u062A\u0646\u0628\u064A\u0647\u0627\u062A." }
+    "\u{1F6AB} \u062D\u0638\u0631 \u0645\u0633\u062A\u062E\u062F\u0645": { action: "ban" },
+    "\u2705 \u0641\u0643 \u0627\u0644\u062D\u0638\u0631": { action: "unban" },
+    "\u23F1\uFE0F \u0645\u062F\u0629 \u0627\u0644\u062A\u0646\u0638\u064A\u0641": { action: "cleanup" },
+    "\u{1F4E3} \u0625\u0631\u0633\u0627\u0644 \u0644\u0644\u062C\u0645\u064A\u0639": { action: "broadcast" },
+    "\u2795 \u0625\u0636\u0627\u0641\u0629 \u0642\u0646\u0627\u0629/\u0628\u0648\u062A": { action: "addChannel" },
+    "\u2796 \u0625\u0632\u0627\u0644\u0629 \u0642\u0646\u0627\u0629/\u0628\u0648\u062A": { action: "removeChannel" }
   };
   if (inputs[text2]) {
     beginAdminInput(telegramId, inputs[text2].action);
-    await sendMessage(chatId, `\u270D\uFE0F ${inputs[text2].prompt}
-\u064A\u0645\u0643\u0646\u0643 \u0627\u0644\u0625\u0644\u063A\u0627\u0621 \u0628\u0632\u0631 \xAB\u0625\u0644\u063A\u0627\u0621 \u0627\u0644\u0625\u062F\u062E\u0627\u0644\xBB.`, { replyMarkup: OWNER_KEYBOARD });
+    await sendMessage(chatId, `\u270D\uFE0F ${pendingInputPrompt(inputs[text2].action)}
+\u064A\u0645\u0643\u0646\u0643 \u0627\u062E\u062A\u064A\u0627\u0631 \u0632\u0631 \u0623\u062F\u0627\u0631\u064A \u0622\u062E\u0631 \u0644\u0625\u0644\u063A\u0627\u0621 \u0647\u0630\u0627 \u0627\u0644\u0625\u062F\u062E\u0627\u0644.`, { replyMarkup });
     return true;
   }
   if (text2 === "\u21A9\uFE0F \u0625\u0644\u063A\u0627\u0621 \u0627\u0644\u0625\u062F\u062E\u0627\u0644") {
     pendingAdminInputs.delete(telegramId);
-    await sendMessage(chatId, "\u062A\u0645 \u0625\u0644\u063A\u0627\u0621 \u0627\u0644\u0625\u062F\u062E\u0627\u0644 \u0627\u0644\u062D\u0627\u0644\u064A.", { replyMarkup: OWNER_KEYBOARD });
+    await sendMessage(chatId, "\u062A\u0645 \u0625\u0644\u063A\u0627\u0621 \u0627\u0644\u0625\u062F\u062E\u0627\u0644 \u0627\u0644\u062D\u0627\u0644\u064A.", { replyMarkup });
     return true;
   }
   return false;
@@ -2653,11 +3155,12 @@ async function handlePendingAdminInput(message, text2) {
   if (!pending2) return false;
   if (pending2.expiresAt < Date.now()) {
     pendingAdminInputs.delete(telegramId);
-    await sendMessage(String(message.chat.id), "\u0627\u0646\u062A\u0647\u062A \u0645\u0647\u0644\u0629 \u0627\u0644\u0625\u062F\u062E\u0627\u0644. \u0627\u062E\u062A\u0631 \u0627\u0644\u0632\u0631 \u0627\u0644\u0645\u0637\u0644\u0648\u0628 \u0645\u062C\u062F\u062F\u0627\u064B.", { replyMarkup: OWNER_KEYBOARD });
+    await sendMessage(String(message.chat.id), "\u0627\u0646\u062A\u0647\u062A \u0645\u0647\u0644\u0629 \u0627\u0644\u0625\u062F\u062E\u0627\u0644. \u0627\u062E\u062A\u0631 \u0627\u0644\u0632\u0631 \u0627\u0644\u0645\u0637\u0644\u0648\u0628 \u0645\u062C\u062F\u062F\u0627\u064B.", { replyMarkup: ownerKeyboardFor(telegramId) });
     return true;
   }
   const chatId = String(message.chat.id);
-  const { activeRecipients: activeRecipients2, addOwner: addOwner2, removeOwner: removeOwner2, setTelegramUserBlocked: setTelegramUserBlocked2, updateCleanupInactiveDays: updateCleanupInactiveDays2, updateMaxUsers: updateMaxUsers2 } = await Promise.resolve().then(() => (init_botDb(), botDb_exports));
+  const replyMarkup = ownerKeyboardFor(telegramId);
+  const { activeRecipients: activeRecipients2, setTelegramUserBlocked: setTelegramUserBlocked2, updateCleanupInactiveDays: updateCleanupInactiveDays2 } = await Promise.resolve().then(() => (init_botDb(), botDb_exports));
   try {
     if (pending2.action === "ban" || pending2.action === "unban") {
       const user = await setTelegramUserBlocked2(text2, pending2.action === "ban");
@@ -2665,28 +3168,32 @@ async function handlePendingAdminInput(message, text2) {
       await notifyOwners(`${pending2.action === "ban" ? "\u{1F6AB}" : "\u2705"} <b>\u062A\u0639\u062F\u064A\u0644 \u062D\u0627\u0644\u0629 \u0645\u0633\u062A\u062E\u062F\u0645</b>
 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645: <code>${user.telegramId}</code>
 \u0628\u0648\u0627\u0633\u0637\u0629 \u0627\u0644\u0645\u0627\u0644\u0643: <code>${telegramId}</code>`);
-      await sendMessage(chatId, `\u062A\u0645 ${pending2.action === "ban" ? "\u062D\u0638\u0631" : "\u0641\u0643 \u062D\u0638\u0631"} \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645 \u0628\u0646\u062C\u0627\u062D.`, { replyMarkup: OWNER_KEYBOARD });
-    } else if (pending2.action === "limit") {
-      const value = Number(text2);
-      await updateMaxUsers2(value);
-      await sendMessage(chatId, `\u062A\u0645 \u0636\u0628\u0637 \u0627\u0644\u0633\u0639\u0629 \u0625\u0644\u0649 <b>${value}</b> \u0645\u0633\u062A\u062E\u062F\u0645.`, { replyMarkup: OWNER_KEYBOARD });
+      await sendMessage(chatId, `\u062A\u0645 ${pending2.action === "ban" ? "\u062D\u0638\u0631" : "\u0641\u0643 \u062D\u0638\u0631"} \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645 \u0628\u0646\u062C\u0627\u062D.`, { replyMarkup });
     } else if (pending2.action === "cleanup") {
       const value = Number(text2);
       await updateCleanupInactiveDays2(value);
-      await sendMessage(chatId, `\u062A\u0645 \u0636\u0628\u0637 \u0627\u0644\u062A\u0646\u0638\u064A\u0641 \u0628\u0639\u062F <b>${value}</b> \u064A\u0648\u0645\u0627\u064B \u0645\u0646 \u0639\u062F\u0645 \u0627\u0644\u0646\u0634\u0627\u0637.`, { replyMarkup: OWNER_KEYBOARD });
-    } else if (pending2.action === "addOwner" || pending2.action === "removeOwner") {
-      if (!/^\d+$/.test(text2.trim())) throw new Error("\u0623\u062F\u062E\u0644 \u0645\u0639\u0631\u0641 \u062A\u0644\u063A\u0631\u0627\u0645 \u0631\u0642\u0645\u064A \u0635\u062D\u064A\u062D.");
-      const changed = pending2.action === "addOwner" ? await addOwner2(text2.trim(), telegramId) : await removeOwner2(text2.trim());
-      if (!changed) throw new Error("\u0644\u0645 \u064A\u062A\u063A\u064A\u0631 \u0634\u064A\u0621. \u062A\u062D\u0642\u0642 \u0645\u0646 \u0627\u0644\u0645\u0639\u0631\u0651\u0641.");
-      await notifyOwners(`\u{1F451} <b>\u062A\u0639\u062F\u064A\u0644 \u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0645\u0644\u0627\u0643</b>
-\u0627\u0644\u0625\u062C\u0631\u0627\u0621: ${pending2.action === "addOwner" ? "\u0625\u0636\u0627\u0641\u0629" : "\u062D\u0630\u0641"}
+      await sendMessage(chatId, `\u062A\u0645 \u0636\u0628\u0637 \u0627\u0644\u062A\u0646\u0638\u064A\u0641 \u0628\u0639\u062F <b>${value}</b> \u064A\u0648\u0645\u0627\u064B \u0645\u0646 \u0639\u062F\u0645 \u0627\u0644\u0646\u0634\u0627\u0637.`, { replyMarkup });
+    } else if (pending2.action === "addChannel") {
+      const parsed = parseSubscriptionTarget(text2);
+      const added = await addForcedSubscription({ target: parsed.target, inviteUrl: parsed.inviteUrl, label: parsed.label, kind: parsed.kind });
+      if (!added) throw new Error("\u0647\u0630\u0647 \u0627\u0644\u0642\u0646\u0627\u0629/\u0627\u0644\u0628\u0648\u062A \u0645\u0636\u0627\u0641 \u0628\u0627\u0644\u0641\u0639\u0644.");
+      await notifyOwners(`\u{1F512} <b>\u0625\u0636\u0627\u0641\u0629 \u0627\u0634\u062A\u0631\u0627\u0643 \u0625\u062C\u0628\u0627\u0631\u064A</b>
+\u0627\u0644\u0646\u0648\u0639: <b>${parsed.kind}</b>
+\u0627\u0644\u0645\u0639\u0631\u0651\u0641: <code>${escapeHtml(parsed.target)}</code>
+\u0627\u0644\u0631\u0627\u0628\u0637: <code>${escapeHtml(parsed.inviteUrl || "\u2014")}</code>`);
+      await sendMessage(chatId, `\u2705 \u062A\u0645\u062A \u0625\u0636\u0627\u0641\u0629 \xAB<b>${escapeHtml(parsed.label)}</b>\xBB \u0625\u0644\u0649 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643 \u0627\u0644\u0625\u062C\u0628\u0627\u0631\u064A.
+\u0633\u064A\u064F\u0637\u0644\u0628 \u0645\u0646 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646 \u0627\u0644\u0627\u0646\u0636\u0645\u0627\u0645 \u0642\u0628\u0644 \u0627\u0633\u062A\u062E\u062F\u0627\u0645 \u0627\u0644\u0628\u0648\u062A.`, { replyMarkup });
+    } else if (pending2.action === "removeChannel") {
+      const removed = await removeForcedSubscription(text2);
+      if (!removed) throw new Error("\u0644\u0645 \u064A\u062A\u0645 \u0627\u0644\u0639\u062B\u0648\u0631 \u0639\u0644\u0649 \u0647\u0630\u0627 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643. \u062A\u062D\u0642\u0642 \u0645\u0646 \u0627\u0644\u0645\u0639\u0631\u0651\u0641.");
+      await notifyOwners(`\u{1F513} <b>\u0625\u0632\u0627\u0644\u0629 \u0627\u0634\u062A\u0631\u0627\u0643 \u0625\u062C\u0628\u0627\u0631\u064A</b>
 \u0627\u0644\u0645\u0639\u0631\u0651\u0641: <code>${escapeHtml(text2.trim())}</code>`);
-      await sendMessage(chatId, "\u062A\u0645 \u062A\u0639\u062F\u064A\u0644 \u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0645\u0644\u0627\u0643 \u0628\u0646\u062C\u0627\u062D.", { replyMarkup: OWNER_KEYBOARD });
+      await sendMessage(chatId, "\u2705 \u062A\u0645\u062A \u0625\u0632\u0627\u0644\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643 \u0628\u0646\u062C\u0627\u062D.", { replyMarkup });
     } else {
       const content = text2.trim();
       if (!content || content.length > 3500) throw new Error("\u0627\u0643\u062A\u0628 \u0631\u0633\u0627\u0644\u0629 \u0628\u064A\u0646 1 \u06483500 \u062D\u0631\u0641\u0627\u064B.");
       const recipients = await activeRecipients2();
-      await sendMessage(chatId, `\u{1F4E3} \u0628\u062F\u0623 \u0627\u0644\u0625\u0631\u0633\u0627\u0644 \u0625\u0644\u0649 <b>${recipients.length}</b> \u0645\u0633\u062A\u062E\u062F\u0645\u0627\u064B \u0646\u0634\u0637\u0627\u064B\u2026`, { replyMarkup: OWNER_KEYBOARD });
+      await sendMessage(chatId, `\u{1F4E3} \u0628\u062F\u0623 \u0627\u0644\u0625\u0631\u0633\u0627\u0644 \u0625\u0644\u0649 <b>${recipients.length}</b> \u0645\u0633\u062A\u062E\u062F\u0645\u0627\u064B \u0646\u0634\u0637\u0627\u064B\u2026`, { replyMarkup });
       let success = 0;
       let failed = 0;
       for (let index2 = 0; index2 < recipients.length; index2 += 20) {
@@ -2696,10 +3203,10 @@ async function handlePendingAdminInput(message, text2) {
       }
       await sendMessage(chatId, `\u062A\u0645 \u0627\u0644\u0625\u0631\u0633\u0627\u0644.
 \u0627\u0644\u0646\u0627\u062C\u062D: <b>${success}</b>
-\u0627\u0644\u0645\u062A\u0639\u0630\u0631: <b>${failed}</b>`, { replyMarkup: OWNER_KEYBOARD });
+\u0627\u0644\u0645\u062A\u0639\u0630\u0631: <b>${failed}</b>`, { replyMarkup });
     }
   } catch (error) {
-    await sendMessage(chatId, `\u062A\u0639\u0630\u0631 \u0627\u0644\u062A\u0646\u0641\u064A\u0630: <b>${escapeHtml(error instanceof Error ? error.message : "\u062E\u0637\u0623 \u063A\u064A\u0631 \u0645\u062A\u0648\u0642\u0639")}</b>`, { replyMarkup: OWNER_KEYBOARD });
+    await sendMessage(chatId, `\u062A\u0639\u0630\u0631 \u0627\u0644\u062A\u0646\u0641\u064A\u0630: <b>${escapeHtml(error instanceof Error ? error.message : "\u062E\u0637\u0623 \u063A\u064A\u0631 \u0645\u062A\u0648\u0642\u0639")}</b>`, { replyMarkup });
   } finally {
     pendingAdminInputs.delete(telegramId);
   }
@@ -2711,10 +3218,18 @@ async function handleMessage(message) {
   const text2 = message.text.trim();
   const chatId = String(message.chat.id);
   const telegramId = String(message.from.id);
+  const role = await getOwnerRole(telegramId);
+  if (!role && !admission.primary) {
+    const missing = await checkForcedSubscriptions(telegramId);
+    if (missing.length) {
+      await sendMessage(chatId, subscriptionGateText(missing), { replyMarkup: subscriptionGateKeyboard(missing) });
+      return;
+    }
+  }
   if (admission.primary) {
     if (text2 === "/admin") {
       pendingAdminInputs.delete(telegramId);
-      return sendAdminPanel(chatId);
+      return sendAdminPanel(chatId, telegramId);
     }
     if (isOwnerControlLabel(text2)) {
       pendingAdminInputs.delete(telegramId);
@@ -2722,7 +3237,15 @@ async function handleMessage(message) {
     }
     if (await handlePendingAdminInput(message, text2)) return;
   }
-  if (text2 === "/start") return sendMessage(chatId, welcomeText(userName(message)), { replyMarkup: keyboardFor(admission.primary) });
+  if (text2 === "/start" || text2 === "\u{1F680} \u062A\u0634\u063A\u064A\u0644 \u0627\u0644\u0628\u0648\u062A" || /^\/start@/i.test(text2)) {
+    pendingAdminInputs.delete(telegramId);
+    pendingReports.delete(telegramId);
+    const info = { username: message.from?.username, language: message.from?.language_code };
+    const user = await getTelegramUser(telegramId);
+    if (user?.firstSeenAt) info.firstSeen = user.firstSeenAt;
+    await sendWelcomePhoto(chatId).catch(() => void 0);
+    return sendMessage(chatId, welcomeText(userName(message), info), { replyMarkup: keyboardFor(admission.primary) });
+  }
   if (text2 === "/help" || text2 === "\u2754 \u0637\u0631\u064A\u0642\u0629 \u0627\u0644\u0627\u0633\u062A\u062E\u062F\u0627\u0645") return sendMessage(chatId, HELP_TEXT, { replyMarkup: keyboardFor(admission.primary) });
   if (text2 === "\u{1F4E9} \u0625\u0631\u0633\u0627\u0644 \u0628\u0644\u0627\u063A") {
     pendingReports.set(telegramId, Date.now() + 10 * 6e4);
@@ -2755,6 +3278,13 @@ async function handleDownloadCallback(callback) {
   const data = callback.data || "";
   const senderId = String(callback.from.id);
   const primary = await isPrimaryOwner(senderId);
+  if (data === "sub_check") {
+    if (!allowCallback(senderId)) return answerCallbackQuery(callback.id, "\u{1F4A1} \u0623\u0646\u062A \u062A\u0636\u063A\u0637 \u0628\u0633\u0631\u0639\u0629. \u0627\u0646\u062A\u0638\u0631 \u0642\u0644\u064A\u0644\u0627\u064B \u062B\u0645 \u0623\u0639\u062F \u0627\u0644\u0645\u062D\u0627\u0648\u0644\u0629.");
+    const missing = await checkForcedSubscriptions(senderId);
+    if (missing.length) return answerCallbackQuery(callback.id, "\u0645\u0627 \u0632\u0644\u062A \u063A\u064A\u0631 \u0645\u0634\u062A\u0631\u0643 \u0641\u064A \u0643\u0644 \u0627\u0644\u0642\u0646\u0648\u0627\u062A \u0627\u0644\u0645\u0637\u0644\u0648\u0628\u0629");
+    await answerCallbackQuery(callback.id, "\u062A\u0645 \u0627\u0644\u062A\u062D\u0642\u0642 \u0645\u0646 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643 \u2705");
+    return sendMessage(chatId, "\u2705 <b>\u062A\u0645 \u0627\u0644\u062A\u062D\u0642\u0642 \u0645\u0646 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643 \u0628\u0646\u062C\u0627\u062D</b>\n\u0627\u0636\u063A\u0637 \xAB\u{1F680} \u062A\u0634\u063A\u064A\u0644 \u0627\u0644\u0628\u0648\u062A\xBB \u062B\u0645 \u0623\u0631\u0633\u0644 \u0631\u0627\u0628\u0637 \u0627\u0644\u0645\u0646\u0634\u0648\u0631 \u0644\u0644\u0628\u062F\u0621.", { replyMarkup: keyboardFor(primary) });
+  }
   if (data.startsWith("cancel:")) {
     const cancelJob = await getMediaJob(data.slice(7));
     const cancelled = await cancelMediaJob(data.slice(7), senderId);
@@ -2783,15 +3313,18 @@ async function handleDownloadCallback(callback) {
     }, retryJob.sourceUrl, primary);
     return;
   }
-  const [, jobId, rawChoice] = data.split(":");
-  if (!jobId || !["video", "audio", "image", "story"].includes(rawChoice)) return answerCallbackQuery(callback.id, "\u0637\u0644\u0628 \u063A\u064A\u0631 \u0635\u0627\u0644\u062D");
+  const parts = data.split(":");
+  const jobId = parts[1];
+  const rawChoice = parts[2];
+  const allImages = rawChoice === "images";
+  const choice = allImages ? "image" : rawChoice;
+  if (!jobId || !["video", "audio", "image", "story"].includes(choice)) return answerCallbackQuery(callback.id, "\u0637\u0644\u0628 \u063A\u064A\u0631 \u0635\u0627\u0644\u062D");
   if (!allowCallback(senderId)) return answerCallbackQuery(callback.id, "\u{1F4A1} \u0623\u0646\u062A \u062A\u0636\u063A\u0637 \u0628\u0633\u0631\u0639\u0629. \u0627\u0646\u062A\u0638\u0631 \u0642\u0644\u064A\u0644\u0627\u064B \u062B\u0645 \u0623\u0639\u062F \u0627\u0644\u0645\u062D\u0627\u0648\u0644\u0629.");
-  const choice = rawChoice;
   const job = await getMediaJob(jobId);
   if (!job || job.telegramId !== senderId || job.status !== "ready" || job.cancelRequested) return answerCallbackQuery(callback.id, "\u0627\u0646\u062A\u0647\u062A \u0635\u0644\u0627\u062D\u064A\u0629 \u0647\u0630\u0627 \u0627\u0644\u0637\u0644\u0628");
-  await answerCallbackQuery(callback.id, "\u0628\u062F\u0623 \u062A\u062C\u0647\u064A\u0632 \u0627\u0644\u0645\u0644\u0641");
+  await answerCallbackQuery(callback.id, allImages ? "\u0628\u062F\u0623 \u062A\u062C\u0647\u064A\u0632 \u0627\u0644\u0635\u0648\u0631" : "\u0628\u062F\u0623 \u062A\u062C\u0647\u064A\u0632 \u0627\u0644\u0645\u0644\u0641");
   await updateMediaJob(jobId, { status: "downloading", selectedChoice: choice });
-  const action = choice === "video" || choice === "story" ? "upload_video" : choice === "audio" ? "upload_audio" : "upload_photo";
+  const action = allImages || choice === "image" ? "upload_photo" : choice === "audio" ? "upload_audio" : "upload_video";
   let workdir;
   let preserveRetryJob = false;
   let deleteJobOnFinish = true;
@@ -2800,6 +3333,7 @@ async function handleDownloadCallback(callback) {
       const beforeDownload = await getMediaJob(jobId);
       if (!beforeDownload || beforeDownload.cancelRequested) throw new DownloaderError("\u062A\u0645 \u0625\u0644\u063A\u0627\u0621 \u0627\u0644\u0639\u0645\u0644\u064A\u0629 \u0628\u0646\u062C\u0627\u062D.");
       await sendChatAction(chatId, action).catch(() => void 0);
+      if (allImages) return downloadAllImages(job.sourceUrl, jobId);
       return downloadMedia(job.sourceUrl, choice, jobId);
     });
     const queueMessage = queued.position > 1 ? `\u23F3 <b>\u0637\u0644\u0628\u0643 \u0641\u064A \u0635\u0641 \u0627\u0644\u062A\u0646\u0632\u064A\u0644</b> \u2014 \u0623\u0645\u0627\u0645\u0643 <b>${queued.position - 1}</b> \u0637\u0644\u0628. \u0633\u064A\u0628\u062F\u0623 \u062A\u0644\u0642\u0627\u0626\u064A\u0627\u064B \u0648\u064A\u0645\u0643\u0646\u0643 \u0627\u0644\u0625\u0644\u063A\u0627\u0621 \u0627\u0644\u0622\u0646.` : "\u23F3 <b>\u062C\u0627\u0631\u064D \u062A\u062C\u0647\u064A\u0632 \u0627\u0644\u0645\u0644\u0641 \u0627\u0644\u0622\u0646\u2026</b> \u0633\u062A\u0635\u0644\u0643 \u0627\u0644\u0646\u062A\u064A\u062C\u0629 \u0647\u0646\u0627 \u0641\u0648\u0631 \u0627\u0643\u062A\u0645\u0627\u0644\u0647\u0627\u060C \u0648\u064A\u0645\u0643\u0646\u0643 \u0627\u0644\u0625\u0644\u063A\u0627\u0621 \u0641\u064A \u0623\u064A \u0648\u0642\u062A.";
@@ -2809,11 +3343,19 @@ async function handleDownloadCallback(callback) {
     const latest = await getMediaJob(jobId);
     if (!latest || latest.cancelRequested) return;
     await sendChatAction(chatId, action).catch(() => void 0);
-    await sendDownloadedMedia(chatId, choice, output.filePath, "\u2705 <b>\u0627\u0643\u062A\u0645\u0644 \u0627\u0644\u062A\u0646\u0632\u064A\u0644</b> \u2014 \u0627\u0644\u0645\u0644\u0641 \u0623\u064F\u0631\u0633\u0644 \u0628\u0646\u062C\u0627\u062D \u0648\u0633\u064A\u064F\u062D\u0630\u0641 \u0645\u0646 \u0627\u0644\u062E\u0627\u062F\u0645 \u0627\u0644\u0622\u0646.");
+    if (allImages) {
+      const files = output.files;
+      const caption = `\u2705 <b>\u0627\u0643\u062A\u0645\u0644 \u062A\u0646\u0632\u064A\u0644 \u0627\u0644\u0635\u0648\u0631</b>
+\u0639\u062F\u062F \u0627\u0644\u0635\u0648\u0631: <b>${files.length}</b>
+\u0633\u064A\u064F\u062D\u0630\u0641 \u0627\u0644\u0645\u0644\u0641 \u0645\u0646 \u0627\u0644\u062E\u0627\u062F\u0645 \u0627\u0644\u0622\u0646.`;
+      await sendMediaGroup(chatId, files.map((file) => ({ path: file.path, caption })));
+    } else {
+      await sendDownloadedMedia(chatId, choice, output.filePath, "\u2705 <b>\u0627\u0643\u062A\u0645\u0644 \u0627\u0644\u062A\u0646\u0632\u064A\u0644</b> \u2014 \u0627\u0644\u0645\u0644\u0641 \u0623\u064F\u0631\u0633\u0644 \u0628\u0646\u062C\u0627\u062D \u0648\u0633\u064A\u064F\u062D\u0630\u0641 \u0645\u0646 \u0627\u0644\u062E\u0627\u062F\u0645 \u0627\u0644\u0622\u0646.");
+    }
     await updateMediaJob(jobId, { status: "sent" });
     await notifyOwners(`\u2705 <b>\u062A\u0646\u0632\u064A\u0644 \u0645\u0643\u062A\u0645\u0644</b>
 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645: <code>${senderId}</code>
-\u0627\u0644\u0646\u0648\u0639: <b>${mediaLabel(choice)}</b>
+\u0627\u0644\u0646\u0648\u0639: <b>${allImages ? "\u0635\u0648\u0631 \u0643\u0627\u0645\u0644\u0629" : mediaLabel(choice)}</b>
 \u0627\u0644\u062D\u062C\u0645: <b>${Math.round(output.bytes / 1024)} KB</b>
 \u0627\u0644\u0631\u0627\u0628\u0637: <code>${escapeHtml(job.sourceUrl.slice(0, 500))}</code>`);
   } catch (error) {
@@ -2837,7 +3379,7 @@ async function handleDownloadCallback(callback) {
     const retryHint = preserveRetryJob ? "\n\n\u064A\u0645\u0643\u0646\u0643 \u0627\u0644\u0636\u063A\u0637 \u0639\u0644\u0649 \xAB\u0625\u0639\u0627\u062F\u0629 \u0645\u062D\u0627\u0648\u0644\u0629 TikTok\xBB \u0644\u0625\u0639\u0627\u062F\u0629 \u0627\u0644\u0641\u062D\u0635 \u062A\u0644\u0642\u0627\u0626\u064A\u0627\u064B." : "";
     await sendMessage(chatId, `\u062A\u0639\u0630\u0631 \u0625\u0643\u0645\u0627\u0644 \u0627\u0644\u062A\u0646\u0632\u064A\u0644.
 <b>${escapeHtml(userFacingMediaError(error))}</b>${retryHint}`, { replyMarkup: retryMarkup });
-    await notifyError({ telegramId: senderId, sourceUrl: job.sourceUrl, stage: "\u062A\u0646\u0632\u064A\u0644 \u0648\u0625\u0631\u0633\u0627\u0644", error, mediaChoice: choice });
+    await notifyError({ telegramId: senderId, sourceUrl: job.sourceUrl, stage: "\u062A\u0646\u0632\u064A\u0644 \u0648\u0625\u0631\u0633\u0627\u0644", error, mediaChoice: allImages ? "image" : choice });
   } finally {
     if (workdir) await purgeDownloadedMedia(workdir);
     if (!preserveRetryJob && deleteJobOnFinish) await deleteMediaJob(jobId);
@@ -2854,6 +3396,57 @@ async function processTelegramUpdate(update) {
     await notifyError({ telegramId, stage: "\u0645\u0639\u0627\u0644\u062C\u0629 \u062A\u062D\u062F\u064A\u062B Telegram", error });
     throw error;
   }
+}
+
+// server/telegram/polling.ts
+var POLL_TIMEOUT_SECONDS = 30;
+var RETRY_DELAY_MS = 3e3;
+var running = false;
+var stopped = false;
+function isPollingEnabled() {
+  const value = (process.env.TELEGRAM_POLLING || "").trim().toLowerCase();
+  return value === "1" || value === "true" || value === "yes";
+}
+async function startTelegramPolling() {
+  if (running) return;
+  if (!process.env.BOT_TOKEN) {
+    console.warn("[Telegram polling] \u062A\u0645 \u062A\u062C\u0627\u0647\u0644 \u0648\u0636\u0639 \u0627\u0644\u0627\u0633\u062A\u0639\u0644\u0627\u0645 \u0644\u0623\u0646 BOT_TOKEN \u063A\u064A\u0631 \u0645\u064F\u0639\u062F.");
+    return;
+  }
+  running = true;
+  stopped = false;
+  try {
+    await deleteWebhook();
+  } catch (error) {
+    console.warn("[Telegram polling] \u062A\u0639\u0630\u0631 \u062D\u0630\u0641 Webhook \u0642\u0628\u0644 \u0627\u0644\u0627\u0633\u062A\u0639\u0644\u0627\u0645\u061B \u0633\u0623\u062A\u0627\u0628\u0639 \u0639\u0644\u0649 \u0623\u064A \u062D\u0627\u0644.", error);
+  }
+  console.log("[Telegram polling] \u0628\u062F\u0623 \u0627\u0644\u0627\u0633\u062A\u0639\u0644\u0627\u0645 \u0627\u0644\u0645\u062D\u0644\u064A \u0639\u0628\u0631 getUpdates. \u0627\u0636\u063A\u0637 Ctrl+C \u0644\u0644\u0625\u064A\u0642\u0627\u0641.");
+  void pollLoop();
+}
+async function pollLoop() {
+  let offset;
+  while (!stopped) {
+    try {
+      const updates = await getUpdates(offset, POLL_TIMEOUT_SECONDS);
+      for (const update of updates) {
+        offset = update.update_id + 1;
+        try {
+          await processTelegramUpdate(update);
+        } catch (error) {
+          console.error("[Telegram polling] \u0641\u0634\u0644 \u0645\u0639\u0627\u0644\u062C\u0629 \u062A\u062D\u062F\u064A\u062B.", error);
+        }
+      }
+    } catch (error) {
+      if (stopped) break;
+      const message = error instanceof TelegramApiError ? error.message : String(error);
+      console.error(`[Telegram polling] \u062E\u0637\u0623 \u0641\u064A getUpdates: ${message}`);
+      await delay(RETRY_DELAY_MS);
+    }
+  }
+  running = false;
+}
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // server/telegram/routes.ts
@@ -2874,6 +3467,9 @@ function registerTelegramRoutes(app) {
     res.json({ ok: true, ...await getTelegramIntegrationStatus() });
   });
   app.post("/api/telegram/activate", async (req, res) => {
+    if (isPollingEnabled()) {
+      return res.status(409).json({ ok: false, error: "polling mode is enabled; remove TELEGRAM_POLLING to use the webhook and avoid duplicated updates" });
+    }
     const status = await getTelegramIntegrationStatus();
     const secret = getWebhookSecret();
     const forwardedProtocol = req.header("x-forwarded-proto")?.split(",")[0]?.trim();
@@ -2942,59 +3538,6 @@ function registerTelegramCleanupRoute(app) {
 
 // server/_core/index.ts
 init_botDb();
-
-// server/telegram/polling.ts
-var POLL_TIMEOUT_SECONDS = 30;
-var RETRY_DELAY_MS = 3e3;
-var running = false;
-var stopped = false;
-function isPollingEnabled() {
-  const value = (process.env.TELEGRAM_POLLING || "").trim().toLowerCase();
-  return value === "1" || value === "true" || value === "yes";
-}
-async function startTelegramPolling() {
-  if (running) return;
-  if (!process.env.BOT_TOKEN) {
-    console.warn("[Telegram polling] \u062A\u0645 \u062A\u062C\u0627\u0647\u0644 \u0648\u0636\u0639 \u0627\u0644\u0627\u0633\u062A\u0639\u0644\u0627\u0645 \u0644\u0623\u0646 BOT_TOKEN \u063A\u064A\u0631 \u0645\u064F\u0639\u062F.");
-    return;
-  }
-  running = true;
-  stopped = false;
-  try {
-    await deleteWebhook();
-  } catch (error) {
-    console.warn("[Telegram polling] \u062A\u0639\u0630\u0631 \u062D\u0630\u0641 Webhook \u0642\u0628\u0644 \u0627\u0644\u0627\u0633\u062A\u0639\u0644\u0627\u0645\u061B \u0633\u0623\u062A\u0627\u0628\u0639 \u0639\u0644\u0649 \u0623\u064A \u062D\u0627\u0644.", error);
-  }
-  console.log("[Telegram polling] \u0628\u062F\u0623 \u0627\u0644\u0627\u0633\u062A\u0639\u0644\u0627\u0645 \u0627\u0644\u0645\u062D\u0644\u064A \u0639\u0628\u0631 getUpdates. \u0627\u0636\u063A\u0637 Ctrl+C \u0644\u0644\u0625\u064A\u0642\u0627\u0641.");
-  void pollLoop();
-}
-async function pollLoop() {
-  let offset;
-  while (!stopped) {
-    try {
-      const updates = await getUpdates(offset, POLL_TIMEOUT_SECONDS);
-      for (const update of updates) {
-        offset = update.update_id + 1;
-        try {
-          await processTelegramUpdate(update);
-        } catch (error) {
-          console.error("[Telegram polling] \u0641\u0634\u0644 \u0645\u0639\u0627\u0644\u062C\u0629 \u062A\u062D\u062F\u064A\u062B.", error);
-        }
-      }
-    } catch (error) {
-      if (stopped) break;
-      const message = error instanceof TelegramApiError ? error.message : String(error);
-      console.error(`[Telegram polling] \u062E\u0637\u0623 \u0641\u064A getUpdates: ${message}`);
-      await delay(RETRY_DELAY_MS);
-    }
-  }
-  running = false;
-}
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-// server/_core/index.ts
 function isPortAvailable(port) {
   return new Promise((resolve) => {
     const server = net2.createServer();

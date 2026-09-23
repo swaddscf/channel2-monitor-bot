@@ -296,7 +296,8 @@ export async function inspectMediaLink(rawUrl: string, jobId?: string): Promise<
     const ext = String(format.ext || "").toLowerCase();
     return imageExtensions.includes(ext) && (!format.vcodec || format.vcodec === "none");
   });
-  const hasImage = hasImageFormat || Boolean(imageUrlsFromMetadata(metadata).length);
+  const sourceImageUrls = imageUrlsFromMetadata(metadata);
+  const hasImage = hasImageFormat || Boolean(sourceImageUrls.length);
   const choices: MediaChoice[] = [];
   if (hasVideo) choices.push(story ? "story" : "video");
   if (hasAudio) choices.push("audio");
@@ -321,8 +322,9 @@ export async function inspectMediaLink(rawUrl: string, jobId?: string): Promise<
     title: cleanTitle(metadata.title),
     choices,
     durationSeconds: typeof metadata.duration === "number" ? metadata.duration : undefined,
-    thumbnail: imageUrlFromMetadata(metadata),
+    thumbnail: sourceImageUrls[0],
   };
+  if (sourceImageUrls.length > 1) result.imageCount = sourceImageUrls.length;
   if (enrichedAccount) result.account = enrichedAccount;
   return result;
 }
@@ -383,4 +385,40 @@ export async function downloadMedia(rawUrl: string, choice: MediaChoice, jobId: 
 
 export async function purgeDownloadedMedia(workdir: string) {
   await rm(workdir, { recursive: true, force: true });
+}
+
+async function writeRemoteImage(url: string, destination: string): Promise<number> {
+  const response = await fetch(url);
+  if (!response.ok) throw new DownloaderError("رفض المصدر جلب إحدى الصور حالياً. جرّب الرابط مرة أخرى لاحقاً.");
+  const contentType = response.headers.get("content-type") || "image/jpeg";
+  if (!contentType.startsWith("image/")) throw new DownloaderError("أحد الملفات التي أرجعها المصدر ليس صورة صالحة.");
+  const bytes = Buffer.from(await response.arrayBuffer());
+  if (bytes.byteLength > MAX_MEDIA_BYTES) throw new DownloaderError("حجم إحدى الصور أكبر من الحد الآمن للإرسال عبر البوت.");
+  await writeFile(destination, bytes);
+  return bytes.byteLength;
+}
+
+function extensionForUrl(url: string) {
+  return /\.png(?:$|[?#])/i.test(url) ? "png" : /\.webp(?:$|[?#])/i.test(url) ? "webp" : /\.gif(?:$|[?#])/i.test(url) ? "gif" : "jpg";
+}
+
+export async function downloadAllImages(rawUrl: string, jobId: string) {
+  const workdir = await mkdtemp(path.join(os.tmpdir(), `telegram-gallery-${jobId}-`));
+  try {
+    const metadata = await loadMetadata(rawUrl, jobId);
+    const urls = Array.from(new Set(imageUrlsFromMetadata(metadata)));
+    if (!urls.length) throw new DownloaderError("لم يؤكد المصدر روابط صور قابلة للإرسال. تحقق أن المشاركة عامة ومتاحة.");
+    const files: Array<{ path: string }> = [];
+    let totalBytes = 0;
+    for (let index = 0; index < urls.length; index += 1) {
+      const filePath = path.join(workdir, `media-${index + 1}.${extensionForUrl(urls[index])}`);
+      const bytes = await writeRemoteImage(urls[index], filePath);
+      totalBytes += bytes;
+      files.push({ path: filePath });
+    }
+    return { workdir, files, bytes: totalBytes };
+  } catch (error) {
+    await rm(workdir, { recursive: true, force: true });
+    throw error;
+  }
 }

@@ -1,5 +1,8 @@
 import { nanoid } from "nanoid";
-import { canAdmitNewUser, cleanupInactiveBefore, isValidCleanupDays, isValidMaxUsers } from "./policy";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { cleanupInactiveBefore, isValidCleanupDays } from "./policy";
+import type { ForcedSubscription } from "./types";
 import type { TelegramFrom } from "./types";
 
 const DEFAULT_SETTINGS = {
@@ -75,10 +78,54 @@ const store = {
   owners: new Map<string, MemoryBotOwner>(),
   jobs: new Map<string, MemoryBotJob>(),
   errors: [] as MemoryBotError[],
+  subscriptions: new Map<string, ForcedSubscription>(),
   processedUpdateIds: new Set<number>(),
   nextUserId: 1,
   nextErrorId: 1,
 };
+
+function subscriptionsFile() {
+  const dir = process.env.DATA_DIR?.trim() || path.join(process.cwd(), "data");
+  return path.join(dir, "subscriptions.json");
+}
+
+let subscriptionsPersistenceReady: Promise<void> | undefined;
+let subscriptionsWriteChain: Promise<void> = Promise.resolve();
+
+async function loadSubscriptionsFromDisk() {
+  try {
+    const raw = await readFile(subscriptionsFile(), "utf8");
+    const parsed = JSON.parse(raw) as ForcedSubscription[];
+    if (Array.isArray(parsed)) {
+      store.subscriptions.clear();
+      parsed.forEach(subscription => store.subscriptions.set(subscription.id, { ...subscription, createdAt: new Date(subscription.createdAt) }));
+    }
+  } catch {
+    // First boot or unwritable storage: start with an empty list.
+    try {
+      await mkdir(path.dirname(subscriptionsFile()), { recursive: true });
+      await saveSubscriptionsToDisk();
+    } catch { /* persistence is best-effort */ }
+  }
+}
+
+function saveSubscriptionsToDisk() {
+  subscriptionsWriteChain = subscriptionsWriteChain.then(async () => {
+    const data = JSON.stringify(Array.from(store.subscriptions.values()), null, 2);
+    try {
+      await mkdir(path.dirname(subscriptionsFile()), { recursive: true });
+      await writeFile(subscriptionsFile(), data, "utf8");
+    } catch { /* persistence is best-effort */ }
+  });
+  return subscriptionsWriteChain.catch(() => undefined);
+}
+
+function ensureSubscriptionsLoaded() {
+  if (!subscriptionsPersistenceReady) {
+    subscriptionsPersistenceReady = loadSubscriptionsFromDisk();
+  }
+  return subscriptionsPersistenceReady;
+}
 
 function cloneSetting() {
   return { ...store.settings };
@@ -90,9 +137,11 @@ export function resetBotMemoryStore() {
   store.owners.clear();
   store.jobs.clear();
   store.errors = [];
+  store.subscriptions.clear();
   store.processedUpdateIds.clear();
   store.nextUserId = 1;
   store.nextErrorId = 1;
+  subscriptionsPersistenceReady = undefined;
 }
 
 export async function ensureBotSettings() {
@@ -142,9 +191,6 @@ export async function touchAndAdmitUser(from: TelegramFrom): Promise<{ admission
     return { admission: "active", isNew: false };
   }
 
-  const role = store.owners.get(telegramId)?.role;
-  const total = Array.from(store.users.values()).filter(user => user.status === "active").length;
-  if (!canAdmitNewUser(total, store.settings.maxUsers, role)) return { admission: "capacity", isNew: true };
   store.users.set(telegramId, {
     id: store.nextUserId++,
     telegramId,
@@ -255,6 +301,10 @@ export async function listTelegramUsers(kind: "recent" | "active" | "blocked" | 
   return sorted.slice(0, limit);
 }
 
+export async function getTelegramUser(telegramId: string) {
+  return store.users.get(String(telegramId));
+}
+
 export async function findTelegramUser(identifier: string) {
   const normalized = identifier.trim().replace(/^@/, "");
   if (/^\d+$/.test(normalized)) {
@@ -306,11 +356,6 @@ export async function removeOwner(telegramId: string) {
   return true;
 }
 
-export async function updateMaxUsers(maxUsers: number) {
-  if (!isValidMaxUsers(maxUsers)) throw new Error("الحد يجب أن يكون عدداً صحيحاً بين 1 و1,000,000.");
-  store.settings = { ...store.settings, maxUsers, updatedAt: new Date() };
-}
-
 export async function updateCleanupInactiveDays(days: number) {
   if (!isValidCleanupDays(days)) throw new Error("مدة التنظيف يجب أن تكون بين 7 و365 يوماً.");
   store.settings = { ...store.settings, cleanupInactiveDays: days, updatedAt: new Date() };
@@ -346,6 +391,44 @@ export async function activeRecipients() {
   return Array.from(store.users.values())
     .filter(user => user.status === "active")
     .map(user => ({ telegramId: user.telegramId }));
+}
+
+export async function listForcedSubscriptions() {
+  await ensureSubscriptionsLoaded();
+  return Array.from(store.subscriptions.values()).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+}
+
+export async function addForcedSubscription(input: Omit<ForcedSubscription, "id" | "createdAt">) {
+  await ensureSubscriptionsLoaded();
+  const normalized = input.target.trim();
+  const existing = Array.from(store.subscriptions.values()).find(subscription => subscription.target === normalized);
+  if (existing) return false;
+  const subscription: ForcedSubscription = {
+    ...input,
+    target: normalized,
+    id: nanoid(12),
+    createdAt: new Date(),
+  };
+  store.subscriptions.set(subscription.id, subscription);
+  await saveSubscriptionsToDisk();
+  return true;
+}
+
+export async function removeForcedSubscription(identifier: string) {
+  await ensureSubscriptionsLoaded();
+  const cleaned = identifier.trim().replace(/^https:\/\/t\.me\//, "").replace(/^@/, "");
+  const subscription = Array.from(store.subscriptions.values())
+    .find(candidate => candidate.id === identifier.trim() || candidate.target === cleaned || candidate.label === identifier.trim());
+  if (!subscription) return false;
+  store.subscriptions.delete(subscription.id);
+  await saveSubscriptionsToDisk();
+  return true;
+}
+
+export async function findForcedSubscription(target: string) {
+  await ensureSubscriptionsLoaded();
+  const normalized = target.replace(/^@/, "");
+  return Array.from(store.subscriptions.values()).find(subscription => subscription.target.replace(/^@/, "") === normalized);
 }
 
 export async function cleanupStaleJobs() {

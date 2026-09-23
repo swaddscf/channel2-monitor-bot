@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mediaChoiceKeyboard, OWNER_KEYBOARD, OWNER_SUBSCRIPTIONS_KEYBOARD, retryTikTokKeyboard, subscriptionGateKeyboard, USER_KEYBOARD } from "./messages";
-import type { ForcedSubscription } from "./types";
+import { inspectionText, mediaChoiceKeyboard, OWNER_KEYBOARD, OWNER_SUBSCRIPTIONS_KEYBOARD, retryTikTokKeyboard, subscriptionGateKeyboard, USER_KEYBOARD } from "./messages";
+import type { ForcedSubscription, InspectResult } from "./types";
 
 describe("أزرار Telegram الملونة", () => {
   afterEach(() => {
@@ -66,6 +66,13 @@ describe("أزرار Telegram الملونة", () => {
   it("لا يضيف زر الصور كاملة عندما تكون الصورة فردية", () => {
     const texts = mediaChoiceKeyboard("job1", ["image"]).inline_keyboard.flat().map(button => button.text);
     expect(texts).not.toContain("🖼 تنزيل الصور كاملة");
+  });
+
+  it("يعرض نوع الوسيط بوضوح في نص الفحص", () => {
+    const result: InspectResult = { platform: "instagram", title: "فيلم قصير", choices: ["video", "audio"] };
+    const text = inspectionText(result);
+    expect(text).toContain("النوع: <b>🎬 فيديو + 🎵 صوت</b>");
+    expect(text).not.toContain("عدد الصور");
   });
 
   it("يبني زر إعادة محاولة TikTok بنمط primary", () => {

@@ -26,6 +26,7 @@ export async function startTelegramPolling() {
     console.warn("[Telegram polling] تعذر حذف Webhook قبل الاستعلام؛ سأتابع على أي حال.", error);
   }
   console.log("[Telegram polling] بدأ الاستعلام المحلي عبر getUpdates. اضغط Ctrl+C للإيقاف.");
+  console.log("[Telegram polling] تنبيه: يجب تشغيل نسخة واحدة فقط من البوت (نفس التوكن). تشغيل نسخة محلية ومستضافة معاً أو نسخ قديمة يُسبب تكرار الردود.");
   void pollLoop();
 }
 

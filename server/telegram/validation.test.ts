@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { extractFacebookOpenGraphImage, extractTwitterOpenGraphImage, imageUrlFromMetadata, imageUrlsFromMetadata, snapchatRequestArgs, tiktokImpersonationArgs, twitterRequestArgs } from "./downloader";
+import { extractFacebookOpenGraphImage, extractTwitterOpenGraphImage, imageUrlFromMetadata, imageUrlsFromMetadata, originalImageUrlsFromMetadata, snapchatRequestArgs, tiktokImpersonationArgs, twitterRequestArgs } from "./downloader";
 import { welcomeText } from "./messages";
 import { PublicLinkError, inspectSupportedUrl, isSafeWebhookSecret, matchesWebhookSecret, normalizeTikTokMediaUrl } from "./validation";
 
@@ -72,7 +72,7 @@ describe("اختيار الصورة الأصلية", () => {
     expect(url).toBe("https://cdn.example.org/original.png");
   });
 
-  it("يجمع صوراً أصلية متعددة من بيانات دوارة ويزيل التكرار", () => {
+  it("يستخرج الصور الأصلية متعددة من دوران ويحذف التكرار", () => {
     const urls = imageUrlsFromMetadata({
       carousel_media: [
         { image_url: "https://cdn.example.org/first.jpg", width: 900, mime_type: "image/jpeg" },
@@ -82,6 +82,32 @@ describe("اختيار الصورة الأصلية", () => {
       thumbnails: [{ url: "https://cdn.example.org/fallback.jpg", width: 200, ext: "jpg" }],
     });
     expect(urls).toEqual(["https://cdn.example.org/second.webp", "https://cdn.example.org/first.jpg", "https://cdn.example.org/fallback.jpg"]);
+  });
+
+  it("لا يعدّ أغلفة (Thumbnails) الفيديو ضمن الصور الأصلية", () => {
+    const originals = originalImageUrlsFromMetadata({
+      title: "Reel video",
+      url: "https://cdn.example.org/video.mp4",
+      vcodec: "avc1.640028",
+      ext: "mp4",
+      formats: [{ url: "https://cdn.example.org/video.mp4", vcodec: "avc1.640028", ext: "mp4" }],
+      thumbnails: [
+        { url: "https://cdn.example.org/cover-320.jpg", width: 320, ext: "jpg" },
+        { url: "https://cdn.example.org/cover-1080.jpg", width: 1080, ext: "jpg" },
+      ],
+    });
+    expect(originals).toEqual([]);
+  });
+
+  it("يستخرج الصور الأصلية للألبوم ويستبعد غلاف الفيديو التمثيلي", () => {
+    const originals = originalImageUrlsFromMetadata({
+      carousel_media: [
+        { image_url: "https://cdn.example.org/pic1.jpg", width: 900, mime_type: "image/jpeg" },
+        { image_url: "https://cdn.example.org/pic2.jpg", width: 900, mime_type: "image/jpeg" },
+      ],
+      thumbnails: [{ url: "https://cdn.example.org/cover.jpg", width: 1080, ext: "jpg" }],
+    });
+    expect(originals).toEqual(["https://cdn.example.org/pic1.jpg", "https://cdn.example.org/pic2.jpg"]);
   });
 
   it("يستخرج صورة X العامة من Open Graph ويرفض صفحة المحتوى الحساس", () => {

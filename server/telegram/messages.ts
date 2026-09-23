@@ -190,6 +190,12 @@ export function subscriptionGateKeyboard(missing: ForcedSubscription[]) {
 export function inspectionText(result: InspectResult) {
   const duration = result.durationSeconds ? `\nالمدة التقريبية: <b>${Math.round(result.durationSeconds)} ثانية</b>` : "";
   const imagesCount = result.imageCount && result.imageCount > 1 ? `\n🖼 عدد الصور المتاحة: <b>${result.imageCount}</b>` : "";
+  const typeParts: string[] = [];
+  if (result.choices.includes("story")) typeParts.push("🎞 ستوري");
+  else if (result.choices.includes("video")) typeParts.push("🎬 فيديو");
+  if (result.choices.includes("image")) typeParts.push("🖼 صورة");
+  if (result.choices.includes("audio")) typeParts.push("🎵 صوت");
+  const typeLine = typeParts.length ? `\nالنوع: <b>${typeParts.join(" + ")}</b>` : "";
   const platformLabels: Record<InspectResult["platform"], string> = {
     tiktok: "TikTok",
     instagram: "Instagram",
@@ -223,7 +229,7 @@ export function inspectionText(result: InspectResult) {
   return `✦ <b>تم فحص الرابط</b>
 
 المنصة: <b>${platformLabels[result.platform]}</b>
-العنوان: <b>${escapeHtml(result.title)}</b>${duration}${imagesCount}${accountBlock}
+العنوان: <b>${escapeHtml(result.title)}</b>${duration}${typeLine}${imagesCount}${accountBlock}
 
 اختر نوع الملف المناسب. لا يُعرض إلا ما أكده الفحص من هذا الرابط العام.`;
 }

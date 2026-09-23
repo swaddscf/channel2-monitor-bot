@@ -40,9 +40,37 @@ function isTikTokRetryablePageError(message: string) {
   return /\[TikTok\].*Unexpected response from webpage request|Unexpected response from webpage request/i.test(message);
 }
 
+const YT_DLP_CANDIDATES = ["yt-dlp", "/usr/local/bin/yt-dlp", "/usr/bin/yt-dlp"];
+let resolvedYtDlpBinary: string | undefined;
+
+function probeYtDlpBinary(candidate: string) {
+  return new Promise<boolean>(resolve => {
+    const child = spawn(candidate, ["--version"], { stdio: "ignore" });
+    child.on("error", () => resolve(false));
+    child.on("close", code => resolve(code === 0));
+  });
+}
+
+async function resolveYtDlpBinary() {
+  if (resolvedYtDlpBinary) return resolvedYtDlpBinary;
+  for (const candidate of YT_DLP_CANDIDATES) {
+    if (await probeYtDlpBinary(candidate)) {
+      resolvedYtDlpBinary = candidate;
+      return candidate;
+    }
+  }
+  throw new DownloaderError("محرك التنزيل (yt-dlp) غير مثبت على الخادم. أعد نشر الحاوية من أحدث صورة في GitHub، وأوقف أي نسخة قديمة أو تشغيل محلي لنفس البوت.");
+}
+
 function runYtDlp(args: string[], timeoutMs: number, jobId?: string) {
-  return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
-    const child = spawn("yt-dlp", args, { stdio: ["ignore", "pipe", "pipe"] });
+  return new Promise<{ stdout: string; stderr: string }>(async (resolve, reject) => {
+    let binary: string;
+    try {
+      binary = await resolveYtDlpBinary();
+    } catch (error) {
+      return reject(error);
+    }
+    const child = spawn(binary, args, { stdio: ["ignore", "pipe", "pipe"] });
     if (jobId) activeProcesses.set(jobId, child);
     let stdout = "";
     let stderr = "";
@@ -55,6 +83,10 @@ function runYtDlp(args: string[], timeoutMs: number, jobId?: string) {
     child.on("error", error => {
       clearTimeout(timer);
       if (jobId) activeProcesses.delete(jobId);
+      if (/ENOENT/i.test(error.message)) {
+        resolvedYtDlpBinary = undefined;
+        return reject(new DownloaderError("تعذر تشغيل محرك التنزيل: yt-dlp غير مثبت في هذه البيئة. أعد نشر الحاوية وأوقف النسخ المكررة من البوت."));
+      }
       reject(new DownloaderError(`تعذر تشغيل محرك التنزيل: ${error.message}`));
     });
     child.on("close", code => {
@@ -117,7 +149,7 @@ function candidateFrom(item: Record<string, unknown>, original: boolean): ImageC
     .map(url => ({ url, width, original }));
 }
 
-export function imageUrlsFromMetadata(metadata: Record<string, unknown>) {
+function collectImageCandidates(metadata: Record<string, unknown>) {
   const originals: ImageCandidate[] = [];
   const thumbnails: ImageCandidate[] = [];
   const collect = (item: Record<string, unknown>, fromThumbnail = false) => {
@@ -138,8 +170,20 @@ export function imageUrlsFromMetadata(metadata: Record<string, unknown>) {
     itemThumbnails.forEach(thumbnail => { if (thumbnail && typeof thumbnail === "object") collect(thumbnail as Record<string, unknown>, true); });
   };
   collect(metadata);
-  const ordered = [...originals, ...thumbnails].sort((a, b) => Number(b.original) - Number(a.original) || b.width - a.width);
-  return Array.from(new Map(ordered.map(candidate => [candidate.url, candidate])).values()).map(candidate => candidate.url);
+  const unique = (candidates: ImageCandidate[]) =>
+    Array.from(new Map(
+      candidates.sort((a, b) => Number(b.original) - Number(a.original) || b.width - a.width).map(candidate => [candidate.url, candidate]),
+    ).values()).map(candidate => candidate.url);
+  return { originals: unique(originals), thumbnails: unique(thumbnails) };
+}
+
+export function imageUrlsFromMetadata(metadata: Record<string, unknown>) {
+  const { originals, thumbnails } = collectImageCandidates(metadata);
+  return [...originals, ...thumbnails];
+}
+
+export function originalImageUrlsFromMetadata(metadata: Record<string, unknown>) {
+  return collectImageCandidates(metadata).originals;
 }
 
 export function imageUrlFromMetadata(metadata: Record<string, unknown>) {
@@ -297,7 +341,8 @@ export async function inspectMediaLink(rawUrl: string, jobId?: string): Promise<
     return imageExtensions.includes(ext) && (!format.vcodec || format.vcodec === "none");
   });
   const sourceImageUrls = imageUrlsFromMetadata(metadata);
-  const hasImage = hasImageFormat || Boolean(sourceImageUrls.length);
+  const originalImages = originalImageUrlsFromMetadata(metadata);
+  const hasImage = hasImageFormat || originalImages.length > 0 || (!hasVideo && sourceImageUrls.length > 0);
   const choices: MediaChoice[] = [];
   if (hasVideo) choices.push(story ? "story" : "video");
   if (hasAudio) choices.push("audio");
@@ -324,7 +369,7 @@ export async function inspectMediaLink(rawUrl: string, jobId?: string): Promise<
     durationSeconds: typeof metadata.duration === "number" ? metadata.duration : undefined,
     thumbnail: sourceImageUrls[0],
   };
-  if (sourceImageUrls.length > 1) result.imageCount = sourceImageUrls.length;
+  if (sourceImageUrls.length > 1) result.imageCount = (hasVideo && originalImages.length === 0 ? 0 : (originalImages.length || sourceImageUrls.length));
   if (enrichedAccount) result.account = enrichedAccount;
   return result;
 }

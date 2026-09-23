@@ -2102,9 +2102,34 @@ function snapchatRequestArgs(platform) {
 function isTikTokRetryablePageError(message) {
   return /\[TikTok\].*Unexpected response from webpage request|Unexpected response from webpage request/i.test(message);
 }
+var YT_DLP_CANDIDATES = ["yt-dlp", "/usr/local/bin/yt-dlp", "/usr/bin/yt-dlp"];
+var resolvedYtDlpBinary;
+function probeYtDlpBinary(candidate) {
+  return new Promise((resolve) => {
+    const child = spawn2(candidate, ["--version"], { stdio: "ignore" });
+    child.on("error", () => resolve(false));
+    child.on("close", (code) => resolve(code === 0));
+  });
+}
+async function resolveYtDlpBinary() {
+  if (resolvedYtDlpBinary) return resolvedYtDlpBinary;
+  for (const candidate of YT_DLP_CANDIDATES) {
+    if (await probeYtDlpBinary(candidate)) {
+      resolvedYtDlpBinary = candidate;
+      return candidate;
+    }
+  }
+  throw new DownloaderError("\u0645\u062D\u0631\u0643 \u0627\u0644\u062A\u0646\u0632\u064A\u0644 (yt-dlp) \u063A\u064A\u0631 \u0645\u062B\u0628\u062A \u0639\u0644\u0649 \u0627\u0644\u062E\u0627\u062F\u0645. \u0623\u0639\u062F \u0646\u0634\u0631 \u0627\u0644\u062D\u0627\u0648\u064A\u0629 \u0645\u0646 \u0623\u062D\u062F\u062B \u0635\u0648\u0631\u0629 \u0641\u064A GitHub\u060C \u0648\u0623\u0648\u0642\u0641 \u0623\u064A \u0646\u0633\u062E\u0629 \u0642\u062F\u064A\u0645\u0629 \u0623\u0648 \u062A\u0634\u063A\u064A\u0644 \u0645\u062D\u0644\u064A \u0644\u0646\u0641\u0633 \u0627\u0644\u0628\u0648\u062A.");
+}
 function runYtDlp(args, timeoutMs, jobId) {
-  return new Promise((resolve, reject) => {
-    const child = spawn2("yt-dlp", args, { stdio: ["ignore", "pipe", "pipe"] });
+  return new Promise(async (resolve, reject) => {
+    let binary;
+    try {
+      binary = await resolveYtDlpBinary();
+    } catch (error) {
+      return reject(error);
+    }
+    const child = spawn2(binary, args, { stdio: ["ignore", "pipe", "pipe"] });
     if (jobId) activeProcesses.set(jobId, child);
     let stdout = "";
     let stderr = "";
@@ -2121,6 +2146,10 @@ function runYtDlp(args, timeoutMs, jobId) {
     child.on("error", (error) => {
       clearTimeout(timer);
       if (jobId) activeProcesses.delete(jobId);
+      if (/ENOENT/i.test(error.message)) {
+        resolvedYtDlpBinary = void 0;
+        return reject(new DownloaderError("\u062A\u0639\u0630\u0631 \u062A\u0634\u063A\u064A\u0644 \u0645\u062D\u0631\u0643 \u0627\u0644\u062A\u0646\u0632\u064A\u0644: yt-dlp \u063A\u064A\u0631 \u0645\u062B\u0628\u062A \u0641\u064A \u0647\u0630\u0647 \u0627\u0644\u0628\u064A\u0626\u0629. \u0623\u0639\u062F \u0646\u0634\u0631 \u0627\u0644\u062D\u0627\u0648\u064A\u0629 \u0648\u0623\u0648\u0642\u0641 \u0627\u0644\u0646\u0633\u062E \u0627\u0644\u0645\u0643\u0631\u0631\u0629 \u0645\u0646 \u0627\u0644\u0628\u0648\u062A."));
+      }
       reject(new DownloaderError(`\u062A\u0639\u0630\u0631 \u062A\u0634\u063A\u064A\u0644 \u0645\u062D\u0631\u0643 \u0627\u0644\u062A\u0646\u0632\u064A\u0644: ${error.message}`));
     });
     child.on("close", (code) => {
@@ -2174,7 +2203,7 @@ function candidateFrom(item, original) {
   const preferredKeys = ["original_url", "image_url", "display_url", "url"];
   return preferredKeys.map((key) => typeof item[key] === "string" ? item[key] : "").filter((url) => typeof url === "string" && url.startsWith("https://")).map((url) => ({ url, width, original }));
 }
-function imageUrlsFromMetadata(metadata) {
+function collectImageCandidates(metadata) {
   const originals = [];
   const thumbnails = [];
   const collect = (item, fromThumbnail = false) => {
@@ -2199,8 +2228,17 @@ function imageUrlsFromMetadata(metadata) {
     });
   };
   collect(metadata);
-  const ordered = [...originals, ...thumbnails].sort((a, b) => Number(b.original) - Number(a.original) || b.width - a.width);
-  return Array.from(new Map(ordered.map((candidate) => [candidate.url, candidate])).values()).map((candidate) => candidate.url);
+  const unique = (candidates) => Array.from(new Map(
+    candidates.sort((a, b) => Number(b.original) - Number(a.original) || b.width - a.width).map((candidate) => [candidate.url, candidate])
+  ).values()).map((candidate) => candidate.url);
+  return { originals: unique(originals), thumbnails: unique(thumbnails) };
+}
+function imageUrlsFromMetadata(metadata) {
+  const { originals, thumbnails } = collectImageCandidates(metadata);
+  return [...originals, ...thumbnails];
+}
+function originalImageUrlsFromMetadata(metadata) {
+  return collectImageCandidates(metadata).originals;
 }
 function imageUrlFromMetadata(metadata) {
   return imageUrlsFromMetadata(metadata)[0];
@@ -2354,7 +2392,8 @@ async function inspectMediaLink(rawUrl, jobId) {
     return imageExtensions.includes(ext) && (!format.vcodec || format.vcodec === "none");
   });
   const sourceImageUrls = imageUrlsFromMetadata(metadata);
-  const hasImage = hasImageFormat || Boolean(sourceImageUrls.length);
+  const originalImages = originalImageUrlsFromMetadata(metadata);
+  const hasImage = hasImageFormat || originalImages.length > 0 || !hasVideo && sourceImageUrls.length > 0;
   const choices = [];
   if (hasVideo) choices.push(story ? "story" : "video");
   if (hasAudio) choices.push("audio");
@@ -2379,7 +2418,7 @@ async function inspectMediaLink(rawUrl, jobId) {
     durationSeconds: typeof metadata.duration === "number" ? metadata.duration : void 0,
     thumbnail: sourceImageUrls[0]
   };
-  if (sourceImageUrls.length > 1) result.imageCount = sourceImageUrls.length;
+  if (sourceImageUrls.length > 1) result.imageCount = hasVideo && originalImages.length === 0 ? 0 : originalImages.length || sourceImageUrls.length;
   if (enrichedAccount) result.account = enrichedAccount;
   return result;
 }
@@ -2704,6 +2743,13 @@ function inspectionText(result) {
 \u0627\u0644\u0645\u062F\u0629 \u0627\u0644\u062A\u0642\u0631\u064A\u0628\u064A\u0629: <b>${Math.round(result.durationSeconds)} \u062B\u0627\u0646\u064A\u0629</b>` : "";
   const imagesCount = result.imageCount && result.imageCount > 1 ? `
 \u{1F5BC} \u0639\u062F\u062F \u0627\u0644\u0635\u0648\u0631 \u0627\u0644\u0645\u062A\u0627\u062D\u0629: <b>${result.imageCount}</b>` : "";
+  const typeParts = [];
+  if (result.choices.includes("story")) typeParts.push("\u{1F39E} \u0633\u062A\u0648\u0631\u064A");
+  else if (result.choices.includes("video")) typeParts.push("\u{1F3AC} \u0641\u064A\u062F\u064A\u0648");
+  if (result.choices.includes("image")) typeParts.push("\u{1F5BC} \u0635\u0648\u0631\u0629");
+  if (result.choices.includes("audio")) typeParts.push("\u{1F3B5} \u0635\u0648\u062A");
+  const typeLine = typeParts.length ? `
+\u0627\u0644\u0646\u0648\u0639: <b>${typeParts.join(" + ")}</b>` : "";
   const platformLabels = {
     tiktok: "TikTok",
     instagram: "Instagram",
@@ -2739,7 +2785,7 @@ ${lines.join("\n")}`;
   return `\u2726 <b>\u062A\u0645 \u0641\u062D\u0635 \u0627\u0644\u0631\u0627\u0628\u0637</b>
 
 \u0627\u0644\u0645\u0646\u0635\u0629: <b>${platformLabels[result.platform]}</b>
-\u0627\u0644\u0639\u0646\u0648\u0627\u0646: <b>${escapeHtml(result.title)}</b>${duration}${imagesCount}${accountBlock}
+\u0627\u0644\u0639\u0646\u0648\u0627\u0646: <b>${escapeHtml(result.title)}</b>${duration}${typeLine}${imagesCount}${accountBlock}
 
 \u0627\u062E\u062A\u0631 \u0646\u0648\u0639 \u0627\u0644\u0645\u0644\u0641 \u0627\u0644\u0645\u0646\u0627\u0633\u0628. \u0644\u0627 \u064A\u064F\u0639\u0631\u0636 \u0625\u0644\u0627 \u0645\u0627 \u0623\u0643\u062F\u0647 \u0627\u0644\u0641\u062D\u0635 \u0645\u0646 \u0647\u0630\u0627 \u0627\u0644\u0631\u0627\u0628\u0637 \u0627\u0644\u0639\u0627\u0645.`;
 }
@@ -3421,6 +3467,7 @@ async function startTelegramPolling() {
     console.warn("[Telegram polling] \u062A\u0639\u0630\u0631 \u062D\u0630\u0641 Webhook \u0642\u0628\u0644 \u0627\u0644\u0627\u0633\u062A\u0639\u0644\u0627\u0645\u061B \u0633\u0623\u062A\u0627\u0628\u0639 \u0639\u0644\u0649 \u0623\u064A \u062D\u0627\u0644.", error);
   }
   console.log("[Telegram polling] \u0628\u062F\u0623 \u0627\u0644\u0627\u0633\u062A\u0639\u0644\u0627\u0645 \u0627\u0644\u0645\u062D\u0644\u064A \u0639\u0628\u0631 getUpdates. \u0627\u0636\u063A\u0637 Ctrl+C \u0644\u0644\u0625\u064A\u0642\u0627\u0641.");
+  console.log("[Telegram polling] \u062A\u0646\u0628\u064A\u0647: \u064A\u062C\u0628 \u062A\u0634\u063A\u064A\u0644 \u0646\u0633\u062E\u0629 \u0648\u0627\u062D\u062F\u0629 \u0641\u0642\u0637 \u0645\u0646 \u0627\u0644\u0628\u0648\u062A (\u0646\u0641\u0633 \u0627\u0644\u062A\u0648\u0643\u0646). \u062A\u0634\u063A\u064A\u0644 \u0646\u0633\u062E\u0629 \u0645\u062D\u0644\u064A\u0629 \u0648\u0645\u0633\u062A\u0636\u0627\u0641\u0629 \u0645\u0639\u0627\u064B \u0623\u0648 \u0646\u0633\u062E \u0642\u062F\u064A\u0645\u0629 \u064A\u064F\u0633\u0628\u0628 \u062A\u0643\u0631\u0627\u0631 \u0627\u0644\u0631\u062F\u0648\u062F.");
   void pollLoop();
 }
 async function pollLoop() {

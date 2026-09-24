@@ -59,7 +59,8 @@ pnpm dev
 
 لتشغيل البوت دائماً دون تكلفة، اتبع أنسب دليل لحالتك (كلها وضع Polling بلا دومين أو HTTPS):
 
-- **بلا بطاقة ائتمان (الأسهل):** [`BACK4APP_DEPLOY.md`](./BACK4APP_DEPLOY.md) — Back4App Containers المجاني من GitHub + منبّه منع النوم. بديل احتياطي فيه: ClawCloud Run.
+- **الموصى به (بلا بطاقة ولا نوم أبداً):** [blitz.cloud](https://beta.blitz.cloud) — مجاني، يبني `Dockerfile` مباشرة من مستودع GitHub العام، ويُفعَّل له وضع «Runs in the background» (لا ينام، بلا رابط عام). أضف متغيرات البيئة من تبويب Environment ثم أعد التشغيل.
+- **بلا بطاقة ائتمان:** [`BACK4APP_DEPLOY.md`](./BACK4APP_DEPLOY.md) — Back4App Containers المجاني + منبّه منع النوم، لكن رابطه المؤقت ينتهي كل ~42 ساعة فتلزم إعادة نشر. بديل احتياطي: ClawCloud Run.
 - Render: [`RENDER_DEPLOY.md`](./RENDER_DEPLOY.md) — لكن Render يطلب بطاقة للتحقق حالياً.
 - الأضمن 24/7 (يتطلب بطاقة للتحقق): [`DEPLOY_FREE.md`](./DEPLOY_FREE.md) — جهاز Oracle Cloud Always Free + Docker.
 

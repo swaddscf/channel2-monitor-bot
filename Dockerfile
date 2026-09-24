@@ -6,6 +6,8 @@ WORKDIR /app
 
 ENV NODE_ENV=production
 ENV PORT=3000
+ENV HOME=/home/app
+ENV PYTHONUNBUFFERED=1
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ffmpeg python3 python3-pip zip ca-certificates \

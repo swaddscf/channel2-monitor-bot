@@ -117,11 +117,14 @@ let schemaReady: Promise<void> | undefined;
 
 function getPool() {
   if (!pool) {
+    const url = (process.env.SUPABASE_DATABASE_URL || "").trim();
+    const useTls = !/sslmode=disable/i.test(url) && /(\.|pooler\.)supabase\.com/i.test(url);
     pool = new pg.Pool({
-      connectionString: (process.env.SUPABASE_DATABASE_URL || "").trim(),
+      connectionString: url,
       max: 10,
       idleTimeoutMillis: 30_000,
       connectionTimeoutMillis: 15_000,
+      ssl: useTls ? { rejectUnauthorized: false } : undefined,
     });
     pool.on("error", error => console.error("[Supabase] pool error", error));
   }

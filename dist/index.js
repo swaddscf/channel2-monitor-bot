@@ -47,11 +47,14 @@ async function initializeSupabaseStorage() {
 }
 function getPool() {
   if (!pool) {
+    const url = (process.env.SUPABASE_DATABASE_URL || "").trim();
+    const useTls = !/sslmode=disable/i.test(url) && /(\.|pooler\.)supabase\.com/i.test(url);
     pool = new pg.Pool({
-      connectionString: (process.env.SUPABASE_DATABASE_URL || "").trim(),
+      connectionString: url,
       max: 10,
       idleTimeoutMillis: 3e4,
-      connectionTimeoutMillis: 15e3
+      connectionTimeoutMillis: 15e3,
+      ssl: useTls ? { rejectUnauthorized: false } : void 0
     });
     pool.on("error", (error) => console.error("[Supabase] pool error", error));
   }

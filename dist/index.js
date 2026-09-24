@@ -36,8 +36,7 @@ import path3 from "node:path";
 import pg from "pg";
 import { nanoid } from "nanoid";
 function isSupabaseConfigured() {
-  const url = (process.env.SUPABASE_DATABASE_URL || "").trim();
-  return url.length > 0;
+  return getConnectionString().length > 0;
 }
 async function initializeSupabaseStorage() {
   if (!isSupabaseConfigured()) return false;
@@ -45,9 +44,42 @@ async function initializeSupabaseStorage() {
   console.log("[Supabase] storage connected, schema ready");
   return true;
 }
+function isValidSupabaseUrl(raw) {
+  const trimmed = raw.trim();
+  if (!trimmed) return false;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== "postgres:" && parsed.protocol !== "postgresql:") return false;
+    if (!parsed.hostname) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+function getConnectionString() {
+  const raw = (process.env.SUPABASE_DATABASE_URL || "").trim();
+  if (cachedConnectionString && cachedConnectionString.raw === raw) return cachedConnectionString.value;
+  if (!raw) {
+    cachedConnectionString = { raw, value: "" };
+    return "";
+  }
+  if (isValidSupabaseUrl(raw)) {
+    cachedConnectionString = { raw, value: raw };
+    return raw;
+  }
+  cachedConnectionString = { raw, value: "" };
+  if (!invalidUrlLogged) {
+    invalidUrlLogged = true;
+    console.error("[Supabase] SUPABASE_DATABASE_URL \u063A\u064A\u0631 \u0635\u0627\u0644\u062D\u060C \u0627\u0644\u0628\u0648\u062A \u0633\u064A\u0648\u0627\u0635\u0644 \u0627\u0644\u0639\u0645\u0644 \u0628\u062A\u062E\u0632\u064A\u0646 JSON \u0627\u0644\u0645\u062D\u0644\u064A \u062D\u062A\u0649 \u064A\u064F\u0635\u0644\u062D.");
+    console.error("[Supabase] \u0627\u0644\u0633\u0628\u0628 \u0627\u0644\u0623\u0631\u062C\u062D: \u0633\u0644\u0633\u0644\u0629 \u0627\u0644\u0627\u062A\u0635\u0627\u0644 \u062A\u062D\u062A\u0648\u064A \u0631\u0645\u0632\u0627\u064B \u0645\u0631\u0641\u0648\u0636\u0627\u064B (# \u0623\u0648 , \u0623\u0648 % \u0646\u0627\u0642\u0635) \u0623\u0648 \u0644\u0627 \u062A\u0632\u0627\u0644 \u0641\u064A\u0647\u0627 \u0639\u0628\u0627\u0631\u0629 [YOUR-PASSWORD].");
+    console.error("[Supabase] \u0627\u0644\u062D\u0644 \u0627\u0644\u0623\u0636\u0645\u0646 \u0645\u0646 \u0644\u0648\u062D\u0629 Supabase: Project Settings -> Database -> Reset database password\u060C \u0636\u0639 \u0643\u0644\u0645\u0629 \u0645\u0631\u0648\u0631 \u0645\u0646 \u062D\u0631\u0648\u0641 \u0648\u0623\u0631\u0642\u0627\u0645 \u0641\u0642\u0637 \u0628\u0644\u0627 \u0631\u0645\u0648\u0632 (\u0645\u062B\u0627\u0644 Mk92pQx41vBz)\u060C \u062B\u0645 \u0627\u0633\u062A\u0628\u062F\u0644 [YOUR-PASSWORD] \u0628\u0647\u0627 \u0648\u0623\u0639\u062F \u062D\u0641\u0638 \u0627\u0644\u0645\u062A\u063A\u064A\u0631 \u0641\u064A Back4App \u062B\u0645 \u0623\u0639\u062F \u0627\u0644\u0646\u0634\u0631.");
+  }
+  return "";
+}
 function getPool() {
   if (!pool) {
-    const url = (process.env.SUPABASE_DATABASE_URL || "").trim();
+    const url = getConnectionString();
+    if (!url) throw new Error("Supabase storage is not configured");
     const useTls = !/sslmode=disable/i.test(url) && /(\.|pooler\.)supabase\.com/i.test(url);
     pool = new pg.Pool({
       connectionString: url,
@@ -410,7 +442,7 @@ async function trimClaims(before) {
   await ensureSchema();
   await run("DELETE FROM tg_claims WHERE claimed_at < $1", [before]);
 }
-var SCHEMA_SQL, pool, schemaReady, USER_COLUMNS;
+var SCHEMA_SQL, pool, schemaReady, cachedConnectionString, invalidUrlLogged, USER_COLUMNS;
 var init_supabase = __esm({
   "server/telegram/supabase.ts"() {
     "use strict";
@@ -474,6 +506,7 @@ CREATE TABLE IF NOT EXISTS tg_claims (
 );
 CREATE INDEX IF NOT EXISTS tg_claims_claimed_at_idx ON tg_claims (claimed_at);
 `;
+    invalidUrlLogged = false;
     USER_COLUMNS = `id, telegram_id AS "telegramId", username, display_name AS "displayName", language_code AS "languageCode", status, first_seen_at AS "firstSeenAt", last_seen_at AS "lastSeenAt", last_activity_at AS "lastActivityAt"`;
   }
 });

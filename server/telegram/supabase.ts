@@ -5,10 +5,13 @@ import { nanoid } from "nanoid";
 import type { ForcedSubscription, SubscriptionPlan, TelegramFrom } from "./types";
 import type { Admission, MemoryBotOwner, MemoryBotSettings, MemoryBotUser, UserAccessRecord } from "./botDb";
 
-/** Active Supabase/Postgres storage only when a connection string is provided. */
+/**
+ * Active Supabase/Postgres storage only when a valid connection string is provided.
+ * A malformed URL (bad symbols, leftover [YOUR-PASSWORD]...) logs a clear one-time
+ * error and gracefully falls back to the local JSON store so the bot keeps working.
+ */
 export function isSupabaseConfigured() {
-  const url = (process.env.SUPABASE_DATABASE_URL || "").trim();
-  return url.length > 0;
+  return getConnectionString().length > 0;
 }
 
 /** Creates all tables at boot (idempotent) and seeds any legacy JSON data. */
@@ -114,10 +117,48 @@ type SettingsRow = {
 
 let pool: pg.Pool | undefined;
 let schemaReady: Promise<void> | undefined;
+let cachedConnectionString: { raw: string; value: string } | undefined;
+let invalidUrlLogged = false;
+
+/** Pure validation so callers can test the accepted URL shape before using it. */
+export function isValidSupabaseUrl(raw: string): boolean {
+  const trimmed = raw.trim();
+  if (!trimmed) return false;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== "postgres:" && parsed.protocol !== "postgresql:") return false;
+    if (!parsed.hostname) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function getConnectionString(): string {
+  const raw = (process.env.SUPABASE_DATABASE_URL || "").trim();
+  if (cachedConnectionString && cachedConnectionString.raw === raw) return cachedConnectionString.value;
+  if (!raw) {
+    cachedConnectionString = { raw, value: "" };
+    return "";
+  }
+  if (isValidSupabaseUrl(raw)) {
+    cachedConnectionString = { raw, value: raw };
+    return raw;
+  }
+  cachedConnectionString = { raw, value: "" };
+  if (!invalidUrlLogged) {
+    invalidUrlLogged = true;
+    console.error("[Supabase] SUPABASE_DATABASE_URL غير صالح، البوت سيواصل العمل بتخزين JSON المحلي حتى يُصلح.");
+    console.error("[Supabase] السبب الأرجح: سلسلة الاتصال تحتوي رمزاً مرفوضاً (# أو , أو % ناقص) أو لا تزال فيها عبارة [YOUR-PASSWORD].");
+    console.error("[Supabase] الحل الأضمن من لوحة Supabase: Project Settings -> Database -> Reset database password، ضع كلمة مرور من حروف وأرقام فقط بلا رموز (مثال Mk92pQx41vBz)، ثم استبدل [YOUR-PASSWORD] بها وأعد حفظ المتغير في Back4App ثم أعد النشر.");
+  }
+  return "";
+}
 
 function getPool() {
   if (!pool) {
-    const url = (process.env.SUPABASE_DATABASE_URL || "").trim();
+    const url = getConnectionString();
+    if (!url) throw new Error("Supabase storage is not configured");
     const useTls = !/sslmode=disable/i.test(url) && /(\.|pooler\.)supabase\.com/i.test(url);
     pool = new pg.Pool({
       connectionString: url,

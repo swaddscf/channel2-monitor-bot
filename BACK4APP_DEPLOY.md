@@ -63,6 +63,7 @@ git push -u origin main
 | `PORT` | `3000` |
 | `DOWNLOAD_MAX_CONCURRENT` | `2` (التنزيل الثقيل يستهلك ذاكرة؛ لا ترفعه فوق 2 على 256MB) |
 | `DOWNLOAD_MAX_WAITING` | `1000` (الطلبات تنتظر بالترتيب ولا تُفقد مع ضغط عالٍ) |
+| `SUPABASE_DATABASE_URL` | اختياري لكن موصى به: سلسلة اتصال Supabase/Postgres. يحفظ كل البيانات في قاعدة دائمة (لا تُمسح عند إعادة النشر) ويمنع الرد المزدوج بقفل عالمي على `update_id`. |
 
 > في Dockerfile لدينا `NODE_OPTIONS=--max-old-space-size=192` ليتحمّل حدّ 256MB. اتركه.
 

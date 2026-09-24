@@ -30,13 +30,458 @@ var init_policy = __esm({
   }
 });
 
+// server/telegram/supabase.ts
+import { readFile as readFile2 } from "node:fs/promises";
+import path3 from "node:path";
+import pg from "pg";
+import { nanoid } from "nanoid";
+function isSupabaseConfigured() {
+  const url = (process.env.SUPABASE_DATABASE_URL || "").trim();
+  return url.length > 0;
+}
+async function initializeSupabaseStorage() {
+  if (!isSupabaseConfigured()) return false;
+  await ensureSchema();
+  console.log("[Supabase] storage connected, schema ready");
+  return true;
+}
+function getPool() {
+  if (!pool) {
+    pool = new pg.Pool({
+      connectionString: (process.env.SUPABASE_DATABASE_URL || "").trim(),
+      max: 10,
+      idleTimeoutMillis: 3e4,
+      connectionTimeoutMillis: 15e3
+    });
+    pool.on("error", (error) => console.error("[Supabase] pool error", error));
+  }
+  return pool;
+}
+async function run(text2, params = []) {
+  const client = await getPool().connect();
+  try {
+    return await client.query(text2, params);
+  } finally {
+    client.release();
+  }
+}
+function ensureSchema() {
+  if (!schemaReady) {
+    schemaReady = (async () => {
+      await run(SCHEMA_SQL);
+      await seedLegacyJson();
+    })().catch((error) => {
+      schemaReady = void 0;
+      throw error;
+    });
+  }
+  return schemaReady;
+}
+function dataDir() {
+  return process.env.DATA_DIR?.trim() || path3.join(process.cwd(), "data");
+}
+async function seedLegacyJson() {
+  try {
+    const existing = await run("SELECT COUNT(*)::int AS count FROM tg_subscriptions");
+    if (Number(existing.rows[0].count) === 0) {
+      const raw = await readFile2(path3.join(dataDir(), "subscriptions.json"), "utf8");
+      const subscriptions = JSON.parse(raw);
+      for (const subscription of subscriptions) {
+        await run(
+          "INSERT INTO tg_subscriptions (id, target, invite_url, label, kind, created_at) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
+          [subscription.id, subscription.target, subscription.inviteUrl, subscription.label, subscription.kind, new Date(subscription.createdAt)]
+        );
+      }
+    }
+  } catch {
+  }
+  try {
+    const existing = await run("SELECT COUNT(*)::int AS count FROM tg_plans");
+    const plansEmpty = Number(existing.rows[0].count) === 0;
+    const accessRaw = await readFile2(path3.join(dataDir(), "access.json"), "utf8").catch(() => null);
+    if (accessRaw) {
+      const parsed = JSON.parse(accessRaw);
+      if (plansEmpty && Array.isArray(parsed.plans)) {
+        for (const plan of parsed.plans) {
+          await run(
+            "INSERT INTO tg_plans (id, name, duration_days, stars, active, created_at) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
+            [plan.id, plan.name, plan.durationDays, plan.stars, plan.active, new Date(plan.createdAt)]
+          );
+        }
+      }
+      if (parsed.users && typeof parsed.users === "object") {
+        for (const [telegramId, record] of Object.entries(parsed.users)) {
+          await run(
+            "INSERT INTO tg_access (telegram_id, subscription_expires_at, subscription_plan_id, download_timestamps) VALUES ($1, $2, $3, $4::jsonb) ON CONFLICT DO NOTHING",
+            [
+              telegramId,
+              record.subscriptionExpiresAt ? new Date(record.subscriptionExpiresAt) : null,
+              record.subscriptionPlanId,
+              JSON.stringify((record.downloadTimestamps || []).filter((value) => typeof value === "number"))
+            ]
+          );
+        }
+      }
+    }
+  } catch {
+  }
+}
+function mapUserRow(row) {
+  return {
+    id: Number(row.id),
+    telegramId: row.telegramId,
+    username: row.username,
+    displayName: row.displayName,
+    languageCode: row.languageCode,
+    status: row.status,
+    firstSeenAt: row.firstSeenAt,
+    lastSeenAt: row.lastSeenAt,
+    lastActivityAt: row.lastActivityAt
+  };
+}
+async function touchUser(from) {
+  await ensureSchema();
+  const telegramId = String(from.id);
+  const displayName = [from.first_name, from.last_name].filter(Boolean).join(" ").slice(0, 160) || "\u0645\u0633\u062A\u062E\u062F\u0645";
+  const existing = await run("SELECT status FROM tg_users WHERE telegram_id = $1", [telegramId]);
+  if (existing.rowCount) {
+    if (existing.rows[0].status === "blocked") return { admission: "blocked", isNew: false };
+    await run(
+      "UPDATE tg_users SET username = $2, display_name = $3, language_code = $4, last_seen_at = now(), last_activity_at = now() WHERE telegram_id = $1",
+      [telegramId, from.username || null, displayName, from.language_code || null]
+    );
+    return { admission: "active", isNew: false };
+  }
+  const insert = await run(
+    "INSERT INTO tg_users (telegram_id, username, display_name, language_code, status, first_seen_at, last_seen_at, last_activity_at) VALUES ($1, $2, $3, $4, 'active', now(), now(), now()) ON CONFLICT (telegram_id) DO NOTHING",
+    [telegramId, from.username || null, displayName, from.language_code || null]
+  );
+  if (!insert.rowCount) {
+    await run(
+      "UPDATE tg_users SET username = $2, display_name = $3, language_code = $4, last_seen_at = now(), last_activity_at = now() WHERE telegram_id = $1",
+      [telegramId, from.username || null, displayName, from.language_code || null]
+    );
+  }
+  return { admission: "active", isNew: true };
+}
+async function getUser(telegramId) {
+  await ensureSchema();
+  const result = await run(`SELECT ${USER_COLUMNS} FROM tg_users WHERE telegram_id = $1`, [String(telegramId)]);
+  return result.rows.length ? mapUserRow(result.rows[0]) : void 0;
+}
+async function findUserByUsername(username) {
+  await ensureSchema();
+  const result = await run(`SELECT ${USER_COLUMNS} FROM tg_users WHERE lower(username) = lower($1) LIMIT 1`, [username]);
+  return result.rows.length ? mapUserRow(result.rows[0]) : void 0;
+}
+async function setUserStatus(telegramId, blocked) {
+  await ensureSchema();
+  const result = await run(
+    `UPDATE tg_users SET status = $2, last_activity_at = now() WHERE telegram_id = $1 RETURNING ${USER_COLUMNS.replace(/^id,/, "")}`,
+    [telegramId, blocked ? "blocked" : "active"]
+  );
+  return result.rows.length ? mapUserRow({ id: "0", ...result.rows[0] }) : void 0;
+}
+async function listUsers(kind, limit, inactiveBefore) {
+  await ensureSchema();
+  let where = "";
+  const params = [];
+  if (kind === "active") where = " WHERE status = 'active'";
+  if (kind === "blocked") where = " WHERE status = 'blocked'";
+  if (kind === "inactive") {
+    where = " WHERE status = 'active' AND last_activity_at < $1";
+    params.push(inactiveBefore);
+  }
+  const limitParam = params.length + 1;
+  const orderBy = kind === "recent" ? "first_seen_at" : "last_seen_at";
+  params.push(limit);
+  const result = await run(`SELECT ${USER_COLUMNS} FROM tg_users${where} ORDER BY ${orderBy} DESC LIMIT $${limitParam}`, params);
+  return result.rows.map((row) => mapUserRow(row));
+}
+async function stats(inactiveBefore, dayStart) {
+  await ensureSchema();
+  const result = await run(
+    `SELECT
+      COUNT(*)::int AS total,
+      COUNT(*) FILTER (WHERE last_activity_at >= $1)::int AS "activeToday",
+      COUNT(*) FILTER (WHERE first_seen_at >= $1)::int AS "joinedToday",
+      COUNT(*) FILTER (WHERE status = 'blocked')::int AS blocked,
+      COUNT(*) FILTER (WHERE status = 'active' AND last_activity_at < $2)::int AS inactive
+    FROM tg_users`,
+    [dayStart, inactiveBefore]
+  );
+  const row = result.rows[0];
+  return { total: row.total, activeToday: row.activeToday, joinedToday: row.joinedToday, blocked: row.blocked, inactive: row.inactive };
+}
+async function activeRecipientIds() {
+  await ensureSchema();
+  const result = await run("SELECT telegram_id FROM tg_users WHERE status = 'active'");
+  return result.rows.map((row) => String(row.telegram_id));
+}
+async function pruneUsers(inactiveBefore, ownerIds) {
+  await ensureSchema();
+  const removed = await run(
+    "DELETE FROM tg_users WHERE status = 'active' AND last_activity_at < $1 AND NOT (telegram_id = ANY($2::text[])) RETURNING telegram_id",
+    [inactiveBefore, ownerIds]
+  );
+  const ids = removed.rows.map((row) => String(row.telegram_id));
+  if (ids.length) {
+    await run("DELETE FROM tg_access WHERE telegram_id = ANY($1::text[])", [ids]);
+  }
+  return ids;
+}
+async function ensurePrimaryOwnerWeb(telegramId) {
+  await ensureSchema();
+  await run(
+    "INSERT INTO tg_owners (telegram_id, role, added_at, added_by) VALUES ($1, 'primary', now(), $1) ON CONFLICT (telegram_id) DO UPDATE SET role = 'primary'",
+    [String(telegramId)]
+  );
+}
+async function getOwnerRole(telegramId) {
+  await ensureSchema();
+  const result = await run("SELECT role FROM tg_owners WHERE telegram_id = $1", [String(telegramId)]);
+  return result.rows.length ? result.rows[0].role : void 0;
+}
+async function listOwners() {
+  await ensureSchema();
+  const result = await run(
+    'SELECT telegram_id AS "telegramId", role, added_at AS "addedAt", added_by AS "addedBy" FROM tg_owners ORDER BY added_at DESC'
+  );
+  return result.rows.map((row) => ({
+    id: 0,
+    telegramId: row.telegramId,
+    role: row.role,
+    addedAt: row.addedAt,
+    addedByTelegramId: row.addedBy
+  }));
+}
+async function addOwner(telegramId, addedByTelegramId) {
+  await ensureSchema();
+  const insert = await run(
+    "INSERT INTO tg_owners (telegram_id, role, added_at, added_by) VALUES ($1, 'owner', now(), $2) ON CONFLICT (telegram_id) DO NOTHING",
+    [telegramId, addedByTelegramId]
+  );
+  return Boolean(insert.rowCount);
+}
+async function removeOwner(telegramId) {
+  await ensureSchema();
+  const owner = await run("SELECT telegram_id, role FROM tg_owners WHERE telegram_id = $1", [telegramId]);
+  if (!owner.rows.length) return false;
+  if (owner.rows[0].role === "primary") return "primary";
+  await run("DELETE FROM tg_owners WHERE telegram_id = $1", [telegramId]);
+  return true;
+}
+async function getSettings() {
+  await ensureSchema();
+  const result = await run(
+    `SELECT id, max_users AS "maxUsers", cleanup_inactive_days AS "cleanupInactiveDays", cleanup_temp_minutes AS "cleanupTempMinutes",
+     broadcast_rate_per_second AS "broadcastRatePerSecond", notify_new_users AS "notifyNewUsers",
+     usage_limit_enabled AS "usageLimitEnabled", usage_limit_count AS "usageLimitCount",
+     usage_limit_window_hours AS "usageLimitWindowHours", paid_mode_enabled AS "paidModeEnabled", updated_at AS "updatedAt"
+     FROM tg_settings WHERE id = 1`
+  );
+  if (result.rows.length) return result.rows[0];
+  const defaults = {
+    maxUsers: 100,
+    cleanupInactiveDays: 30,
+    cleanupTempMinutes: 60,
+    broadcastRatePerSecond: 20,
+    notifyNewUsers: true,
+    usageLimitEnabled: false,
+    usageLimitCount: 5,
+    usageLimitWindowHours: 24,
+    paidModeEnabled: false,
+    updatedAt: /* @__PURE__ */ new Date()
+  };
+  const insert = await run(
+    `INSERT INTO tg_settings (id, max_users, cleanup_inactive_days, cleanup_temp_minutes, broadcast_rate_per_second, notify_new_users, usage_limit_enabled, usage_limit_count, usage_limit_window_hours, paid_mode_enabled, updated_at)
+     VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT DO NOTHING`,
+    [defaults.maxUsers, defaults.cleanupInactiveDays, defaults.cleanupTempMinutes, defaults.broadcastRatePerSecond, defaults.notifyNewUsers, defaults.usageLimitEnabled, defaults.usageLimitCount, defaults.usageLimitWindowHours, defaults.paidModeEnabled, defaults.updatedAt]
+  );
+  if (!insert.rowCount) return (await run(`SELECT id, max_users AS "maxUsers", cleanup_inactive_days AS "cleanupInactiveDays", cleanup_temp_minutes AS "cleanupTempMinutes", broadcast_rate_per_second AS "broadcastRatePerSecond", notify_new_users AS "notifyNewUsers", usage_limit_enabled AS "usageLimitEnabled", usage_limit_count AS "usageLimitCount", usage_limit_window_hours AS "usageLimitWindowHours", paid_mode_enabled AS "paidModeEnabled", updated_at AS "updatedAt" FROM tg_settings WHERE id = 1`)).rows[0];
+  return { id: 1, ...defaults, updatedAt: /* @__PURE__ */ new Date() };
+}
+async function saveSettings(settings) {
+  await ensureSchema();
+  await run(
+    `INSERT INTO tg_settings (id, max_users, cleanup_inactive_days, cleanup_temp_minutes, broadcast_rate_per_second, notify_new_users, usage_limit_enabled, usage_limit_count, usage_limit_window_hours, paid_mode_enabled, updated_at)
+     VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     ON CONFLICT (id) DO UPDATE SET max_users = EXCLUDED.max_users, cleanup_inactive_days = EXCLUDED.cleanup_inactive_days, cleanup_temp_minutes = EXCLUDED.cleanup_temp_minutes, broadcast_rate_per_second = EXCLUDED.broadcast_rate_per_second, notify_new_users = EXCLUDED.notify_new_users, usage_limit_enabled = EXCLUDED.usage_limit_enabled, usage_limit_count = EXCLUDED.usage_limit_count, usage_limit_window_hours = EXCLUDED.usage_limit_window_hours, paid_mode_enabled = EXCLUDED.paid_mode_enabled, updated_at = EXCLUDED.updated_at`,
+    [settings.maxUsers, settings.cleanupInactiveDays, settings.cleanupTempMinutes, settings.broadcastRatePerSecond, settings.notifyNewUsers, settings.usageLimitEnabled, settings.usageLimitCount, settings.usageLimitWindowHours, settings.paidModeEnabled, settings.updatedAt]
+  );
+}
+async function listForcedSubscriptions() {
+  await ensureSchema();
+  const result = await run(
+    'SELECT id, target, invite_url AS "inviteUrl", label, kind, created_at AS "createdAt" FROM tg_subscriptions ORDER BY created_at ASC'
+  );
+  return result.rows.map((row) => ({ id: row.id, target: row.target, inviteUrl: row.inviteUrl, label: row.label, kind: row.kind, createdAt: row.createdAt }));
+}
+async function addForcedSubscription(input) {
+  await ensureSchema();
+  const id = nanoid(12);
+  const insert = await run(
+    "INSERT INTO tg_subscriptions (id, target, invite_url, label, kind, created_at) VALUES ($1, $2, $3, $4, $5, now()) ON CONFLICT (target) DO NOTHING",
+    [id, input.target, input.inviteUrl, input.label, input.kind]
+  );
+  return Boolean(insert.rowCount);
+}
+async function removeForcedSubscription(id) {
+  await ensureSchema();
+  const result = await run("DELETE FROM tg_subscriptions WHERE id = $1", [id]);
+  return Boolean(result.rowCount);
+}
+async function listSubscriptionPlans() {
+  await ensureSchema();
+  const result = await run(
+    'SELECT id, name, duration_days AS "durationDays", stars, active, created_at AS "createdAt" FROM tg_plans ORDER BY created_at ASC'
+  );
+  return result.rows.map((row) => ({ id: row.id, name: row.name, durationDays: row.durationDays, stars: row.stars, active: row.active, createdAt: row.createdAt }));
+}
+async function addSubscriptionPlan(input) {
+  await ensureSchema();
+  const id = nanoid(12);
+  const created = /* @__PURE__ */ new Date();
+  await run(
+    "INSERT INTO tg_plans (id, name, duration_days, stars, active, created_at) VALUES ($1, $2, $3, $4, TRUE, $5)",
+    [id, input.name, input.durationDays, input.stars, created]
+  );
+  return { id, name: input.name, durationDays: input.durationDays, stars: input.stars, active: true, createdAt: created };
+}
+async function findSubscriptionPlanById(id) {
+  await ensureSchema();
+  const result = await run(
+    'SELECT id, name, duration_days AS "durationDays", stars, active, created_at AS "createdAt" FROM tg_plans WHERE id = $1',
+    [id]
+  );
+  return result.rows.length ? { id: result.rows[0].id, name: result.rows[0].name, durationDays: result.rows[0].durationDays, stars: result.rows[0].stars, active: result.rows[0].active, createdAt: result.rows[0].createdAt } : void 0;
+}
+async function setSubscriptionPlanActive(id, active2) {
+  await ensureSchema();
+  const result = await run("UPDATE tg_plans SET active = $2 WHERE id = $1", [id, active2]);
+  return Boolean(result.rowCount);
+}
+async function getAccessRecord(telegramId) {
+  await ensureSchema();
+  const id = String(telegramId);
+  const result = await run(
+    'SELECT subscription_expires_at AS "subscriptionExpiresAt", subscription_plan_id AS "subscriptionPlanId", download_timestamps AS "downloadTimestamps" FROM tg_access WHERE telegram_id = $1',
+    [id]
+  );
+  if (result.rows.length) {
+    const row = result.rows[0];
+    return {
+      subscriptionExpiresAt: row.subscriptionExpiresAt ? row.subscriptionExpiresAt.getTime() : null,
+      subscriptionPlanId: row.subscriptionPlanId,
+      downloadTimestamps: Array.isArray(row.downloadTimestamps) ? row.downloadTimestamps.filter((value) => typeof value === "number") : []
+    };
+  }
+  const record = { subscriptionExpiresAt: null, subscriptionPlanId: null, downloadTimestamps: [] };
+  await run(
+    "INSERT INTO tg_access (telegram_id, subscription_expires_at, subscription_plan_id, download_timestamps) VALUES ($1, NULL, NULL, '[]'::jsonb) ON CONFLICT (telegram_id) DO NOTHING",
+    [id]
+  );
+  return record;
+}
+async function saveAccessRecord(telegramId, record) {
+  await ensureSchema();
+  await run(
+    "INSERT INTO tg_access (telegram_id, subscription_expires_at, subscription_plan_id, download_timestamps) VALUES ($1, $2, $3, $4::jsonb) ON CONFLICT (telegram_id) DO UPDATE SET subscription_expires_at = EXCLUDED.subscription_expires_at, subscription_plan_id = EXCLUDED.subscription_plan_id, download_timestamps = EXCLUDED.download_timestamps",
+    [
+      String(telegramId),
+      record.subscriptionExpiresAt ? new Date(record.subscriptionExpiresAt) : null,
+      record.subscriptionPlanId,
+      JSON.stringify(record.downloadTimestamps || [])
+    ]
+  );
+}
+async function claimUpdate(updateId) {
+  await ensureSchema();
+  const insert = await run(
+    "INSERT INTO tg_claims (update_id, claimed_at) VALUES ($1, now()) ON CONFLICT (update_id) DO NOTHING",
+    [String(updateId)]
+  );
+  return Boolean(insert.rowCount);
+}
+async function trimClaims(before) {
+  await ensureSchema();
+  await run("DELETE FROM tg_claims WHERE claimed_at < $1", [before]);
+}
+var SCHEMA_SQL, pool, schemaReady, USER_COLUMNS;
+var init_supabase = __esm({
+  "server/telegram/supabase.ts"() {
+    "use strict";
+    SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS tg_users (
+  id BIGSERIAL PRIMARY KEY,
+  telegram_id TEXT NOT NULL UNIQUE,
+  username TEXT,
+  display_name TEXT NOT NULL,
+  language_code TEXT,
+  status TEXT NOT NULL DEFAULT 'active',
+  first_seen_at TIMESTAMPTZ NOT NULL,
+  last_seen_at TIMESTAMPTZ NOT NULL,
+  last_activity_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS tg_users_activity_idx ON tg_users (last_activity_at);
+CREATE TABLE IF NOT EXISTS tg_owners (
+  telegram_id TEXT PRIMARY KEY,
+  role TEXT NOT NULL,
+  added_at TIMESTAMPTZ NOT NULL,
+  added_by TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tg_settings (
+  id INTEGER PRIMARY KEY,
+  max_users INTEGER NOT NULL,
+  cleanup_inactive_days INTEGER NOT NULL,
+  cleanup_temp_minutes INTEGER NOT NULL,
+  broadcast_rate_per_second INTEGER NOT NULL,
+  notify_new_users BOOLEAN NOT NULL,
+  usage_limit_enabled BOOLEAN NOT NULL,
+  usage_limit_count INTEGER NOT NULL,
+  usage_limit_window_hours INTEGER NOT NULL,
+  paid_mode_enabled BOOLEAN NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tg_subscriptions (
+  id TEXT PRIMARY KEY,
+  target TEXT NOT NULL UNIQUE,
+  invite_url TEXT NOT NULL,
+  label TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tg_plans (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  duration_days INTEGER NOT NULL,
+  stars INTEGER NOT NULL,
+  active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tg_access (
+  telegram_id TEXT PRIMARY KEY,
+  subscription_expires_at TIMESTAMPTZ,
+  subscription_plan_id TEXT,
+  download_timestamps JSONB NOT NULL DEFAULT '[]'::jsonb
+);
+CREATE TABLE IF NOT EXISTS tg_claims (
+  update_id BIGINT PRIMARY KEY,
+  claimed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS tg_claims_claimed_at_idx ON tg_claims (claimed_at);
+`;
+    USER_COLUMNS = `id, telegram_id AS "telegramId", username, display_name AS "displayName", language_code AS "languageCode", status, first_seen_at AS "firstSeenAt", last_seen_at AS "lastSeenAt", last_activity_at AS "lastActivityAt"`;
+  }
+});
+
 // server/telegram/botDb.ts
 var botDb_exports = {};
 __export(botDb_exports, {
   activeRecipients: () => activeRecipients,
-  addForcedSubscription: () => addForcedSubscription,
-  addOwner: () => addOwner,
-  addSubscriptionPlan: () => addSubscriptionPlan,
+  addForcedSubscription: () => addForcedSubscription2,
+  addOwner: () => addOwner2,
+  addSubscriptionPlan: () => addSubscriptionPlan2,
   botStats: () => botStats,
   cancelLatestActiveJob: () => cancelLatestActiveJob,
   cancelMediaJob: () => cancelMediaJob,
@@ -48,25 +493,25 @@ __export(botDb_exports, {
   ensureBotSettings: () => ensureBotSettings,
   ensurePrimaryOwner: () => ensurePrimaryOwner,
   findForcedSubscription: () => findForcedSubscription,
-  findSubscriptionPlanById: () => findSubscriptionPlanById,
+  findSubscriptionPlanById: () => findSubscriptionPlanById2,
   findTelegramUser: () => findTelegramUser,
   getMediaJob: () => getMediaJob,
-  getOwnerRole: () => getOwnerRole,
+  getOwnerRole: () => getOwnerRole2,
   getTelegramUser: () => getTelegramUser,
   getUserAccess: () => getUserAccess,
   isOwner: () => isOwner,
   isPrimaryOwner: () => isPrimaryOwner,
-  listForcedSubscriptions: () => listForcedSubscriptions,
-  listOwners: () => listOwners,
-  listSubscriptionPlans: () => listSubscriptionPlans,
+  listForcedSubscriptions: () => listForcedSubscriptions2,
+  listOwners: () => listOwners2,
+  listSubscriptionPlans: () => listSubscriptionPlans2,
   listTelegramUsers: () => listTelegramUsers,
   recentErrors: () => recentErrors,
   recordBotError: () => recordBotError,
   recordUserDownload: () => recordUserDownload,
-  removeForcedSubscription: () => removeForcedSubscription,
-  removeOwner: () => removeOwner,
+  removeForcedSubscription: () => removeForcedSubscription2,
+  removeOwner: () => removeOwner2,
   resetBotMemoryStore: () => resetBotMemoryStore,
-  setSubscriptionPlanActive: () => setSubscriptionPlanActive,
+  setSubscriptionPlanActive: () => setSubscriptionPlanActive2,
   setTelegramUserBlocked: () => setTelegramUserBlocked,
   setUserSubscription: () => setUserSubscription,
   touchAndAdmitUser: () => touchAndAdmitUser,
@@ -76,23 +521,23 @@ __export(botDb_exports, {
   updateUsageLimit: () => updateUsageLimit,
   userDownloadsInWindow: () => userDownloadsInWindow
 });
-import { nanoid } from "nanoid";
-import { mkdir, readFile as readFile2, writeFile } from "node:fs/promises";
-import path3 from "node:path";
+import { nanoid as nanoid2 } from "nanoid";
+import { mkdir, readFile as readFile3, writeFile } from "node:fs/promises";
+import path4 from "node:path";
 function configuredPrimaryOwnerId() {
   return (process.env.OWNER_ID || "").trim();
 }
 function subscriptionsFile() {
-  const dir = process.env.DATA_DIR?.trim() || path3.join(process.cwd(), "data");
-  return path3.join(dir, "subscriptions.json");
+  const dir = process.env.DATA_DIR?.trim() || path4.join(process.cwd(), "data");
+  return path4.join(dir, "subscriptions.json");
 }
 function accessFile() {
-  const dir = process.env.DATA_DIR?.trim() || path3.join(process.cwd(), "data");
-  return path3.join(dir, "access.json");
+  const dir = process.env.DATA_DIR?.trim() || path4.join(process.cwd(), "data");
+  return path4.join(dir, "access.json");
 }
 async function loadSubscriptionsFromDisk() {
   try {
-    const raw = await readFile2(subscriptionsFile(), "utf8");
+    const raw = await readFile3(subscriptionsFile(), "utf8");
     const parsed = JSON.parse(raw);
     if (Array.isArray(parsed)) {
       store.subscriptions.clear();
@@ -100,7 +545,7 @@ async function loadSubscriptionsFromDisk() {
     }
   } catch {
     try {
-      await mkdir(path3.dirname(subscriptionsFile()), { recursive: true });
+      await mkdir(path4.dirname(subscriptionsFile()), { recursive: true });
       await saveSubscriptionsToDisk();
     } catch {
     }
@@ -110,7 +555,7 @@ function saveSubscriptionsToDisk() {
   subscriptionsWriteChain = subscriptionsWriteChain.then(async () => {
     const data = JSON.stringify(Array.from(store.subscriptions.values()), null, 2);
     try {
-      await mkdir(path3.dirname(subscriptionsFile()), { recursive: true });
+      await mkdir(path4.dirname(subscriptionsFile()), { recursive: true });
       await writeFile(subscriptionsFile(), data, "utf8");
     } catch {
     }
@@ -125,7 +570,7 @@ function ensureSubscriptionsLoaded() {
 }
 async function loadAccessFromDisk() {
   try {
-    const raw = await readFile2(accessFile(), "utf8");
+    const raw = await readFile3(accessFile(), "utf8");
     const parsed = JSON.parse(raw);
     if (Array.isArray(parsed.plans)) {
       store.plans.clear();
@@ -143,7 +588,7 @@ async function loadAccessFromDisk() {
     }
   } catch {
     try {
-      await mkdir(path3.dirname(accessFile()), { recursive: true });
+      await mkdir(path4.dirname(accessFile()), { recursive: true });
       await saveAccessToDisk();
     } catch {
     }
@@ -157,7 +602,7 @@ function saveAccessToDisk() {
     };
     const data = JSON.stringify(shape, null, 2);
     try {
-      await mkdir(path3.dirname(accessFile()), { recursive: true });
+      await mkdir(path4.dirname(accessFile()), { recursive: true });
       await writeFile(accessFile(), data, "utf8");
     } catch {
     }
@@ -188,13 +633,22 @@ function resetBotMemoryStore() {
   subscriptionsPersistenceReady = void 0;
   accessPersistenceReady = void 0;
 }
+async function ownerRole(telegramId) {
+  if (isSupabaseConfigured()) return getOwnerRole(telegramId);
+  return store.owners.get(String(telegramId))?.role;
+}
 async function ensureBotSettings() {
   ensurePrimaryOwner();
+  if (isSupabaseConfigured()) return getSettings();
   return cloneSetting();
 }
 async function ensurePrimaryOwner() {
   const ownerId = configuredPrimaryOwnerId();
   if (!ownerId) return;
+  if (isSupabaseConfigured()) {
+    await ensurePrimaryOwnerWeb(ownerId);
+    return;
+  }
   const existing = store.owners.get(ownerId);
   if (!existing) {
     store.owners.set(ownerId, { id: store.nextUserId++, telegramId: ownerId, role: "primary", addedAt: /* @__PURE__ */ new Date(), addedByTelegramId: ownerId });
@@ -204,16 +658,17 @@ async function ensurePrimaryOwner() {
     store.owners.set(ownerId, { ...existing, role: "primary" });
   }
 }
-async function getOwnerRole(telegramId) {
-  return store.owners.get(String(telegramId))?.role;
+async function getOwnerRole2(telegramId) {
+  return ownerRole(telegramId);
 }
 async function isOwner(telegramId) {
-  return Boolean(store.owners.get(String(telegramId)));
+  return Boolean(await ownerRole(telegramId));
 }
 async function isPrimaryOwner(telegramId) {
-  return store.owners.get(String(telegramId))?.role === "primary";
+  return await ownerRole(telegramId) === "primary";
 }
 async function touchAndAdmitUser(from) {
+  if (isSupabaseConfigured()) return touchUser(from);
   const telegramId = String(from.id);
   const displayName = [from.first_name, from.last_name].filter(Boolean).join(" ").slice(0, 160) || "\u0645\u0633\u062A\u062E\u062F\u0645";
   const existing = store.users.get(telegramId);
@@ -243,7 +698,7 @@ async function touchAndAdmitUser(from) {
   return { admission: "active", isNew: true };
 }
 async function createMediaJob(telegramId, sourceUrl, platform) {
-  const id = nanoid(18);
+  const id = nanoid2(18);
   store.jobs.set(id, {
     id,
     telegramId,
@@ -283,6 +738,12 @@ async function cancelLatestActiveJob(telegramId) {
 }
 async function claimTelegramUpdate(updateId) {
   if (store.processedUpdateIds.has(updateId)) return false;
+  if (isSupabaseConfigured()) {
+    const fresh = await claimUpdate(updateId);
+    if (!fresh) return false;
+    store.processedUpdateIds.add(updateId);
+    return true;
+  }
   store.processedUpdateIds.add(updateId);
   return true;
 }
@@ -297,6 +758,13 @@ async function recordBotError(input) {
   });
 }
 async function botStats() {
+  if (isSupabaseConfigured()) {
+    const settings = await getSettings();
+    const dayStart2 = /* @__PURE__ */ new Date();
+    dayStart2.setUTCHours(0, 0, 0, 0);
+    const inactiveBefore2 = new Date(Date.now() - settings.cleanupInactiveDays * 864e5);
+    return { ...await stats(inactiveBefore2, dayStart2), settings };
+  }
   const dayStart = /* @__PURE__ */ new Date();
   dayStart.setUTCHours(0, 0, 0, 0);
   const inactiveBefore = new Date(Date.now() - store.settings.cleanupInactiveDays * 864e5);
@@ -311,6 +779,11 @@ async function botStats() {
   };
 }
 async function listTelegramUsers(kind, limit = 50) {
+  if (isSupabaseConfigured()) {
+    const settings = await getSettings();
+    const inactiveBefore2 = new Date(Date.now() - settings.cleanupInactiveDays * 864e5);
+    return listUsers(kind, limit, inactiveBefore2);
+  }
   const inactiveBefore = new Date(Date.now() - store.settings.cleanupInactiveDays * 864e5);
   const all = Array.from(store.users.values());
   const filtered = kind === "active" ? all.filter((user) => user.status === "active") : kind === "blocked" ? all.filter((user) => user.status === "blocked") : kind === "inactive" ? all.filter((user) => user.status === "active" && user.lastActivityAt < inactiveBefore) : all;
@@ -318,10 +791,15 @@ async function listTelegramUsers(kind, limit = 50) {
   return sorted.slice(0, limit);
 }
 async function getTelegramUser(telegramId) {
+  if (isSupabaseConfigured()) return getUser(telegramId);
   return store.users.get(String(telegramId));
 }
 async function findTelegramUser(identifier) {
   const normalized = identifier.trim().replace(/^@/, "");
+  if (isSupabaseConfigured()) {
+    if (/^\d+$/.test(normalized)) return getUser(normalized);
+    return findUserByUsername(normalized);
+  }
   if (/^\d+$/.test(normalized)) {
     return store.users.get(normalized);
   }
@@ -332,6 +810,12 @@ async function findTelegramUser(identifier) {
   return found;
 }
 async function setTelegramUserBlocked(identifier, blocked) {
+  if (isSupabaseConfigured()) {
+    const normalized = identifier.trim().replace(/^@/, "");
+    if (/^\d+$/.test(normalized)) return setUserStatus(normalized, blocked);
+    const user2 = await findUserByUsername(normalized);
+    return user2 ? setUserStatus(user2.telegramId, blocked) : void 0;
+  }
   if (/^\d+$/.test(identifier.trim())) {
     const user2 = store.users.get(identifier.trim());
     if (!user2) return void 0;
@@ -343,12 +827,14 @@ async function setTelegramUserBlocked(identifier, blocked) {
   store.users.set(user.telegramId, { ...user, status: blocked ? "blocked" : "active", lastActivityAt: /* @__PURE__ */ new Date() });
   return user;
 }
-async function listOwners() {
+async function listOwners2() {
+  if (isSupabaseConfigured()) return listOwners();
   return Array.from(store.owners.values()).sort((a, b) => b.addedAt.getTime() - a.addedAt.getTime());
 }
-async function addOwner(telegramId, addedByTelegramId) {
+async function addOwner2(telegramId, addedByTelegramId) {
   const normalized = telegramId.trim();
   if (!/^\d+$/.test(normalized)) throw new Error("\u0623\u062F\u062E\u0644 \u0645\u0639\u0631\u0651\u0641 \u062A\u0644\u063A\u0631\u0627\u0645 \u0631\u0642\u0645\u064A \u0635\u062D\u064A\u062D.");
+  if (isSupabaseConfigured()) return addOwner(normalized, addedByTelegramId);
   if (store.owners.has(normalized)) return false;
   store.owners.set(normalized, {
     id: store.nextUserId++,
@@ -359,7 +845,12 @@ async function addOwner(telegramId, addedByTelegramId) {
   });
   return true;
 }
-async function removeOwner(telegramId) {
+async function removeOwner2(telegramId) {
+  if (isSupabaseConfigured()) {
+    const result = await removeOwner(telegramId);
+    if (result === "primary") throw new Error("\u0644\u0627 \u064A\u0645\u0643\u0646 \u062D\u0630\u0641 \u0627\u0644\u0645\u0627\u0644\u0643 \u0627\u0644\u0623\u0633\u0627\u0633\u064A.");
+    return Boolean(result);
+  }
   const owner = store.owners.get(telegramId);
   if (owner?.role === "primary") throw new Error("\u0644\u0627 \u064A\u0645\u0643\u0646 \u062D\u0630\u0641 \u0627\u0644\u0645\u0627\u0644\u0643 \u0627\u0644\u0623\u0633\u0627\u0633\u064A.");
   if (!owner) return false;
@@ -368,9 +859,31 @@ async function removeOwner(telegramId) {
 }
 async function updateCleanupInactiveDays(days) {
   if (!isValidCleanupDays(days)) throw new Error("\u0645\u062F\u0629 \u0627\u0644\u062A\u0646\u0638\u064A\u0641 \u064A\u062C\u0628 \u0623\u0646 \u062A\u0643\u0648\u0646 \u0628\u064A\u0646 7 \u0648365 \u064A\u0648\u0645\u0627\u064B.");
+  if (isSupabaseConfigured()) {
+    const settings = await getSettings();
+    settings.cleanupInactiveDays = days;
+    settings.updatedAt = /* @__PURE__ */ new Date();
+    await saveSettings(settings);
+    return;
+  }
   store.settings = { ...store.settings, cleanupInactiveDays: days, updatedAt: /* @__PURE__ */ new Date() };
 }
 async function updateUsageLimit(input) {
+  if (isSupabaseConfigured()) {
+    const settings = await getSettings();
+    if (input.enabled !== void 0) settings.usageLimitEnabled = input.enabled;
+    if (input.count !== void 0) {
+      if (!isValidUsageLimitCount(input.count)) throw new Error("\u0639\u062F\u062F \u0627\u0644\u062A\u0646\u0632\u064A\u0644\u0627\u062A \u064A\u062C\u0628 \u0623\u0646 \u064A\u0643\u0648\u0646 \u0631\u0642\u0645\u0627\u064B \u0628\u064A\u0646 1 \u06481000.");
+      settings.usageLimitCount = input.count;
+    }
+    if (input.windowHours !== void 0) {
+      if (!isValidUsageWindowHours(input.windowHours)) throw new Error("\u0646\u0627\u0641\u0630\u0629 \u0627\u0644\u062D\u062F \u064A\u062C\u0628 \u0623\u0646 \u062A\u0643\u0648\u0646 \u0633\u0627\u0639\u0627\u062A \u0628\u064A\u0646 1 \u06488760.");
+      settings.usageLimitWindowHours = input.windowHours;
+    }
+    settings.updatedAt = /* @__PURE__ */ new Date();
+    await saveSettings(settings);
+    return;
+  }
   const next = { ...store.settings, updatedAt: /* @__PURE__ */ new Date() };
   if (input.enabled !== void 0) next.usageLimitEnabled = input.enabled;
   if (input.count !== void 0) {
@@ -384,6 +897,13 @@ async function updateUsageLimit(input) {
   store.settings = next;
 }
 async function updatePaidMode(enabled) {
+  if (isSupabaseConfigured()) {
+    const settings = await getSettings();
+    settings.paidModeEnabled = enabled;
+    settings.updatedAt = /* @__PURE__ */ new Date();
+    await saveSettings(settings);
+    return;
+  }
   store.settings = { ...store.settings, paidModeEnabled: enabled, updatedAt: /* @__PURE__ */ new Date() };
 }
 async function recentErrors(limit = 20) {
@@ -391,11 +911,30 @@ async function recentErrors(limit = 20) {
 }
 async function cleanupBotData() {
   const now = Date.now();
+  if (isSupabaseConfigured()) {
+    const settings = await getSettings();
+    const inactiveBefore2 = cleanupInactiveBefore(settings.cleanupInactiveDays, now);
+    const ownerIds2 = (await listOwners()).map((owner) => owner.telegramId);
+    const removedIds = await pruneUsers(inactiveBefore2, ownerIds2);
+    const removed = new Set(removedIds);
+    store.jobs.forEach((job, id) => {
+      if (removed.has(job.telegramId)) store.jobs.delete(id);
+    });
+    store.errors = store.errors.filter((error) => !removed.has(String(error.telegramId)));
+    store.jobs.forEach((job, id) => {
+      if (job.expiresAt.getTime() < now) store.jobs.delete(id);
+    });
+    store.errors = store.errors.filter((error) => error.createdAt.getTime() >= now - 30 * 864e5);
+    store.processedUpdateIds.clear();
+    await trimClaims(new Date(now - 7 * 864e5));
+    return { removedInactiveUsers: removedIds.length };
+  }
   const inactiveBefore = cleanupInactiveBefore(store.settings.cleanupInactiveDays, now);
   const ownerIds = new Set(store.owners.keys());
   const staleUsers = Array.from(store.users.values()).filter((user) => user.status === "active" && user.lastActivityAt < inactiveBefore && !ownerIds.has(user.telegramId));
   for (const user of staleUsers) {
     store.users.delete(user.telegramId);
+    store.access.delete(user.telegramId);
     store.jobs.forEach((job) => {
       if (job.telegramId === user.telegramId) store.jobs.delete(job.id);
     });
@@ -410,13 +949,19 @@ async function cleanupBotData() {
   return { removedInactiveUsers: staleUsers.length };
 }
 async function activeRecipients() {
+  if (isSupabaseConfigured()) {
+    const ids = await activeRecipientIds();
+    return ids.map((telegramId) => ({ telegramId }));
+  }
   return Array.from(store.users.values()).filter((user) => user.status === "active").map((user) => ({ telegramId: user.telegramId }));
 }
-async function listForcedSubscriptions() {
+async function listForcedSubscriptions2() {
+  if (isSupabaseConfigured()) return listForcedSubscriptions();
   await ensureSubscriptionsLoaded();
   return Array.from(store.subscriptions.values()).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
 }
-async function addForcedSubscription(input) {
+async function addForcedSubscription2(input) {
+  if (isSupabaseConfigured()) return addForcedSubscription(input);
   await ensureSubscriptionsLoaded();
   const normalized = input.target.trim();
   const existing = Array.from(store.subscriptions.values()).find((subscription2) => subscription2.target === normalized);
@@ -424,14 +969,21 @@ async function addForcedSubscription(input) {
   const subscription = {
     ...input,
     target: normalized,
-    id: nanoid(12),
+    id: nanoid2(12),
     createdAt: /* @__PURE__ */ new Date()
   };
   store.subscriptions.set(subscription.id, subscription);
   await saveSubscriptionsToDisk();
   return true;
 }
-async function removeForcedSubscription(identifier) {
+async function removeForcedSubscription2(identifier) {
+  if (isSupabaseConfigured()) {
+    const subscriptions = await listForcedSubscriptions();
+    const cleaned2 = identifier.trim().replace(/^https:\/\/t\.me\//, "").replace(/^@/, "");
+    const subscription2 = subscriptions.find((candidate) => candidate.id === identifier.trim() || candidate.target === cleaned2 || candidate.label === identifier.trim());
+    if (!subscription2) return false;
+    return removeForcedSubscription(subscription2.id);
+  }
   await ensureSubscriptionsLoaded();
   const cleaned = identifier.trim().replace(/^https:\/\/t\.me\//, "").replace(/^@/, "");
   const subscription = Array.from(store.subscriptions.values()).find((candidate) => candidate.id === identifier.trim() || candidate.target === cleaned || candidate.label === identifier.trim());
@@ -441,6 +993,11 @@ async function removeForcedSubscription(identifier) {
   return true;
 }
 async function findForcedSubscription(target) {
+  if (isSupabaseConfigured()) {
+    const normalized2 = target.replace(/^@/, "");
+    const subscriptions = await listForcedSubscriptions();
+    return subscriptions.find((subscription) => subscription.target.replace(/^@/, "") === normalized2);
+  }
   await ensureSubscriptionsLoaded();
   const normalized = target.replace(/^@/, "");
   return Array.from(store.subscriptions.values()).find((subscription) => subscription.target.replace(/^@/, "") === normalized);
@@ -460,7 +1017,12 @@ function accessRecord(telegramId) {
   store.access.set(telegramId, record);
   return record;
 }
+async function persistAccess(telegramId, record) {
+  if (isSupabaseConfigured()) return saveAccessRecord(telegramId, record);
+  await saveAccessToDisk();
+}
 async function getUserAccess(telegramId) {
+  if (isSupabaseConfigured()) return getAccessRecord(String(telegramId));
   await ensureAccessLoaded();
   return accessRecord(String(telegramId));
 }
@@ -474,24 +1036,26 @@ async function recordUserDownload(telegramId, windowHours) {
   const since = Date.now() - windowHours * 36e5;
   record.downloadTimestamps.push(Date.now());
   record.downloadTimestamps = record.downloadTimestamps.filter((timestamp2) => timestamp2 >= since);
-  await saveAccessToDisk();
+  await persistAccess(telegramId, record);
 }
 async function setUserSubscription(telegramId, expiresAt, planId) {
   const record = await getUserAccess(telegramId);
   record.subscriptionExpiresAt = expiresAt;
   record.subscriptionPlanId = planId;
-  await saveAccessToDisk();
+  await persistAccess(telegramId, record);
 }
-async function listSubscriptionPlans() {
+async function listSubscriptionPlans2() {
+  if (isSupabaseConfigured()) return listSubscriptionPlans();
   await ensureAccessLoaded();
   return Array.from(store.plans.values()).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
 }
-async function addSubscriptionPlan(input) {
-  await ensureAccessLoaded();
+async function addSubscriptionPlan2(input) {
   const name = input.name.trim().slice(0, 60);
   if (!name) throw new Error("\u0627\u0643\u062A\u0628 \u0627\u0633\u0645\u0627\u064B \u0644\u0644\u062D\u0632\u0645\u0629.");
+  if (isSupabaseConfigured()) return addSubscriptionPlan({ ...input, name });
+  await ensureAccessLoaded();
   const plan = {
-    id: nanoid(12),
+    id: nanoid2(12),
     name,
     durationDays: input.durationDays,
     stars: input.stars,
@@ -502,11 +1066,19 @@ async function addSubscriptionPlan(input) {
   await saveAccessToDisk();
   return plan;
 }
-async function findSubscriptionPlanById(id) {
+async function findSubscriptionPlanById2(id) {
+  if (isSupabaseConfigured()) return findSubscriptionPlanById(id);
   await ensureAccessLoaded();
   return store.plans.get(id);
 }
-async function setSubscriptionPlanActive(identifier, active2) {
+async function setSubscriptionPlanActive2(identifier, active2) {
+  if (isSupabaseConfigured()) {
+    const cleaned2 = identifier.trim().replace(/^@/, "");
+    const plans = await listSubscriptionPlans();
+    const plan2 = plans.find((candidate) => candidate.id === cleaned2 || candidate.name === cleaned2 || candidate.name.replace(/^@/, "") === cleaned2);
+    if (!plan2) return false;
+    return setSubscriptionPlanActive(plan2.id, active2);
+  }
   await ensureAccessLoaded();
   const cleaned = identifier.trim().replace(/^@/, "");
   const plan = Array.from(store.plans.values()).find((candidate) => candidate.id === cleaned || candidate.name === cleaned || candidate.name.replace(/^@/, "") === cleaned);
@@ -520,6 +1092,7 @@ var init_botDb = __esm({
   "server/telegram/botDb.ts"() {
     "use strict";
     init_policy();
+    init_supabase();
     DEFAULT_SETTINGS = {
       maxUsers: 100,
       cleanupInactiveDays: 30,
@@ -1325,11 +1898,11 @@ function detectStoryLink(rawUrl) {
   try {
     const url = new URL(rawUrl);
     const hostname = url.hostname.toLowerCase().replace(/^www\./, "");
-    const path6 = url.pathname.toLowerCase();
-    if (belongsToHost(hostname, "instagram.com")) return /^\/stories\//.test(path6);
-    if (belongsToHost(hostname, "facebook.com")) return path6.includes("/stories/") || path6.startsWith("/stories");
+    const path7 = url.pathname.toLowerCase();
+    if (belongsToHost(hostname, "instagram.com")) return /^\/stories\//.test(path7);
+    if (belongsToHost(hostname, "facebook.com")) return path7.includes("/stories/") || path7.startsWith("/stories");
     if (belongsToHost(hostname, "snapchat.com")) {
-      return /^\/(?:@[^/]+\/)?(?:spotlight|highlight)\//.test(path6) || /^\/t\//.test(path6);
+      return /^\/(?:@[^/]+\/)?(?:spotlight|highlight)\//.test(path7) || /^\/t\//.test(path7);
     }
     return false;
   } catch {
@@ -1855,11 +2428,11 @@ init_botDb();
 import { spawn as spawn2 } from "node:child_process";
 import { mkdtemp, readdir, rm, stat, writeFile as writeFile2 } from "node:fs/promises";
 import os from "node:os";
-import path5 from "node:path";
+import path6 from "node:path";
 
 // server/telegram/tiktokProfile.ts
 import { spawn } from "node:child_process";
-import path4 from "node:path";
+import path5 from "node:path";
 var PROFILE_CACHE_TTL_MS = 6 * 60 * 60 * 1e3;
 var profileCache = /* @__PURE__ */ new Map();
 var pythonAvailable;
@@ -1999,14 +2572,14 @@ function parseTikTokUniversal(data) {
   const userDetail = scope["webapp.user-detail"];
   const userInfo = userDetail?.userInfo ?? void 0;
   const user = userInfo?.user ?? void 0;
-  const stats = userInfo?.stats ?? void 0;
+  const stats2 = userInfo?.stats ?? void 0;
   const videoDetail = scope["webapp.video-detail"];
   const itemInfo = videoDetail?.itemInfo ?? void 0;
   const item = itemInfo?.itemStruct ?? void 0;
   const author = item?.author ?? void 0;
   const itemStats = item?.stats ?? void 0;
   const source = user ?? author ?? void 0;
-  const counters = stats ?? itemStats ?? void 0;
+  const counters = stats2 ?? itemStats ?? void 0;
   if (!source && !counters) return void 0;
   const usernameValue = pickString(source, "uniqueId", "unique_id", "author");
   const username = usernameValue ? usernameValue.replace(/^@/, "") : void 0;
@@ -2126,7 +2699,7 @@ function isPythonAvailable() {
 }
 async function fetchViaPython(url) {
   if (!await isPythonAvailable()) return void 0;
-  const scriptPath = path4.resolve(process.cwd(), "scripts", "tiktok_profile.py");
+  const scriptPath = path5.resolve(process.cwd(), "scripts", "tiktok_profile.py");
   const result = await runWithTimeout("python3", [scriptPath, url], 15e3);
   if (result.code !== 0 || !result.stdout) return void 0;
   const trimmed = result.stdout.trim();
@@ -2602,8 +3175,8 @@ async function inspectMediaLink(rawUrl, jobId) {
 async function downloadMedia(rawUrl, choice, jobId) {
   let { url, platform } = inspectSupportedUrl(rawUrl);
   if (platform === "tiktok") url = await resolveTikTokPublicUrl(url);
-  const workdir = await mkdtemp(path5.join(os.tmpdir(), `telegram-media-${jobId}-`));
-  const output = path5.join(workdir, "media.%(ext)s");
+  const workdir = await mkdtemp(path6.join(os.tmpdir(), `telegram-media-${jobId}-`));
+  const output = path6.join(workdir, "media.%(ext)s");
   if (choice === "image") {
     try {
       const metadata = await loadMetadata(url.toString(), jobId);
@@ -2618,7 +3191,7 @@ async function downloadMedia(rawUrl, choice, jobId) {
       const bytes = Buffer.from(await response.arrayBuffer());
       if (bytes.byteLength > MAX_MEDIA_BYTES) throw new DownloaderError("\u062D\u062C\u0645 \u0627\u0644\u0635\u0648\u0631\u0629 \u0623\u0643\u0628\u0631 \u0645\u0646 \u0627\u0644\u062D\u062F \u0627\u0644\u0622\u0645\u0646 \u0644\u0644\u0625\u0631\u0633\u0627\u0644 \u0639\u0628\u0631 \u0627\u0644\u0628\u0648\u062A.");
       const extension = contentType.includes("png") ? "png" : contentType.includes("webp") ? "webp" : "jpg";
-      const filePath = path5.join(workdir, `media.${extension}`);
+      const filePath = path6.join(workdir, `media.${extension}`);
       await writeFile2(filePath, bytes);
       return { workdir, filePath, bytes: bytes.byteLength };
     } catch (error) {
@@ -2635,7 +3208,7 @@ async function downloadMedia(rawUrl, choice, jobId) {
   args.push(url.toString());
   try {
     await runYtDlpWithRetry(args, DOWNLOAD_TIMEOUT_MS, jobId);
-    const files = (await readdir(workdir)).filter((file) => !file.endsWith(".part") && !file.endsWith(".ytdl")).map((file) => path5.join(workdir, file));
+    const files = (await readdir(workdir)).filter((file) => !file.endsWith(".part") && !file.endsWith(".ytdl")).map((file) => path6.join(workdir, file));
     if (!files.length) throw new DownloaderError("\u0627\u0643\u062A\u0645\u0644 \u0627\u0644\u0637\u0644\u0628 \u062F\u0648\u0646 \u0645\u0644\u0641 \u0642\u0627\u0628\u0644 \u0644\u0644\u0625\u0631\u0633\u0627\u0644.");
     const candidate = files[0];
     const fileInfo = await stat(candidate);
@@ -2665,7 +3238,7 @@ function extensionForUrl(url) {
   return /\.png(?:$|[?#])/i.test(url) ? "png" : /\.webp(?:$|[?#])/i.test(url) ? "webp" : /\.gif(?:$|[?#])/i.test(url) ? "gif" : "jpg";
 }
 async function downloadAllImages(rawUrl, jobId) {
-  const workdir = await mkdtemp(path5.join(os.tmpdir(), `telegram-gallery-${jobId}-`));
+  const workdir = await mkdtemp(path6.join(os.tmpdir(), `telegram-gallery-${jobId}-`));
   try {
     const metadata = await loadMetadata(rawUrl, jobId);
     const urls = Array.from(new Set(imageUrlsFromMetadata(metadata)));
@@ -2673,7 +3246,7 @@ async function downloadAllImages(rawUrl, jobId) {
     const files = [];
     let totalBytes = 0;
     for (let index2 = 0; index2 < urls.length; index2 += 1) {
-      const filePath = path5.join(workdir, `media-${index2 + 1}.${extensionForUrl(urls[index2])}`);
+      const filePath = path6.join(workdir, `media-${index2 + 1}.${extensionForUrl(urls[index2])}`);
       const bytes = await writeRemoteImage(urls[index2], filePath);
       totalBytes += bytes;
       files.push({ path: filePath });
@@ -2719,13 +3292,13 @@ function pumpQueue() {
     });
   }
 }
-function scheduleDownload(run) {
+function scheduleDownload(run2) {
   if (pending.length >= maxWaiting()) {
     throw new DownloadQueueError("\u0627\u0644\u0628\u0648\u062A \u064A\u0639\u0627\u0644\u062C \u062D\u0627\u0644\u064A\u0627\u064B \u0639\u062F\u062F\u0627\u064B \u0643\u0628\u064A\u0631\u0627\u064B \u0645\u0646 \u0627\u0644\u062A\u0646\u0632\u064A\u0644\u0627\u062A. \u0623\u0639\u062F \u0627\u0644\u0645\u062D\u0627\u0648\u0644\u0629 \u0628\u0639\u062F \u0644\u062D\u0638\u0627\u062A.");
   }
   const position = active + pending.length + 1;
   const completion = new Promise((resolve, reject) => {
-    pending.push({ run, resolve, reject });
+    pending.push({ run: run2, resolve, reject });
     pumpQueue();
   });
   return { position, completion };
@@ -2959,11 +3532,11 @@ function inspectionText(result) {
     } else if (account.verified) {
       lines.push("\u2705 \u062D\u0633\u0627\u0628 \u0645\u0648\u062B\u0642");
     }
-    const stats = [];
-    if (account.followers !== void 0) stats.push(`\u{1F465} <b>${formatCount(account.followers)}</b> \u0645\u062A\u0627\u0628\u0639`);
-    if (account.posts !== void 0) stats.push(`\u{1F4F9} <b>${formatCount(account.posts)}</b> \u0645\u0646\u0634\u0648\u0631`);
-    if (account.hearts !== void 0) stats.push(`\u2764\uFE0F <b>${formatCount(account.hearts)}</b> \u0625\u0639\u062C\u0627\u0628`);
-    if (stats.length) lines.push(stats.join(" \u2022 "));
+    const stats2 = [];
+    if (account.followers !== void 0) stats2.push(`\u{1F465} <b>${formatCount(account.followers)}</b> \u0645\u062A\u0627\u0628\u0639`);
+    if (account.posts !== void 0) stats2.push(`\u{1F4F9} <b>${formatCount(account.posts)}</b> \u0645\u0646\u0634\u0648\u0631`);
+    if (account.hearts !== void 0) stats2.push(`\u2764\uFE0F <b>${formatCount(account.hearts)}</b> \u0625\u0639\u062C\u0627\u0628`);
+    if (stats2.length) lines.push(stats2.join(" \u2022 "));
     const region = countryLabel(account.region);
     if (region) lines.push(`\u{1F4CD} \u0627\u0644\u062F\u0648\u0644\u0629: <b>${escapeHtml(region)}</b>`);
     if (account.signature) lines.push(`\u270D\uFE0F ${escapeHtml(account.signature.slice(0, 150))}`);
@@ -3181,9 +3754,9 @@ async function ensureBotPrimaryOwner() {
   primaryOwnerEnsured = true;
 }
 async function notifyOwners(text2, options = {}) {
-  const { listOwners: listOwners2 } = await Promise.resolve().then(() => (init_botDb(), botDb_exports));
+  const { listOwners: listOwners3 } = await Promise.resolve().then(() => (init_botDb(), botDb_exports));
   const configuredPrimary = (process.env.OWNER_ID || "").trim();
-  const owners = await listOwners2().catch(() => []);
+  const owners = await listOwners3().catch(() => []);
   const recipients = Array.from(new Set([...owners.map((owner) => owner.telegramId), configuredPrimary].filter(Boolean)));
   await Promise.allSettled(recipients.map((ownerId) => sendMessage(ownerId, text2, options)));
 }
@@ -3237,7 +3810,7 @@ async function admitMessage(message) {
   return { admitted: true, primary };
 }
 async function checkForcedSubscriptions(telegramId) {
-  const subscriptions = await listForcedSubscriptions();
+  const subscriptions = await listForcedSubscriptions2();
   if (!subscriptions.length) return [];
   const missing = [];
   for (const subscription of subscriptions) {
@@ -3283,15 +3856,15 @@ async function inspectIncomingLink(message, rawUrl, primary) {
     await notifyError({ telegramId, sourceUrl: rawUrl, stage: "\u0641\u062D\u0635 \u0627\u0644\u0631\u0627\u0628\u0637", error });
   }
 }
-function formatStats(stats) {
+function formatStats(stats2) {
   return `\u{1F4CA} <b>\u0625\u062D\u0635\u0627\u0621\u0627\u062A \u0633\u0631\u064A\u0639\u0629</b>
 
-\u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u0648\u0646: <b>${stats.total}</b>
-\u0627\u0644\u0646\u0634\u0637\u0648\u0646 \u0627\u0644\u064A\u0648\u0645: <b>${stats.activeToday}</b>
-\u0627\u0644\u062C\u062F\u062F \u0627\u0644\u064A\u0648\u0645: <b>${stats.joinedToday}</b>
-\u0627\u0644\u0645\u062D\u0638\u0648\u0631\u0648\u0646: <b>${stats.blocked}</b>
-\u063A\u064A\u0631 \u0627\u0644\u0646\u0634\u0637\u064A\u0646: <b>${stats.inactive}</b>
-\u0627\u0644\u062A\u0646\u0638\u064A\u0641 \u0628\u0639\u062F: <b>${stats.settings.cleanupInactiveDays} \u064A\u0648\u0645\u0627\u064B</b>`;
+\u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u0648\u0646: <b>${stats2.total}</b>
+\u0627\u0644\u0646\u0634\u0637\u0648\u0646 \u0627\u0644\u064A\u0648\u0645: <b>${stats2.activeToday}</b>
+\u0627\u0644\u062C\u062F\u062F \u0627\u0644\u064A\u0648\u0645: <b>${stats2.joinedToday}</b>
+\u0627\u0644\u0645\u062D\u0638\u0648\u0631\u0648\u0646: <b>${stats2.blocked}</b>
+\u063A\u064A\u0631 \u0627\u0644\u0646\u0634\u0637\u064A\u0646: <b>${stats2.inactive}</b>
+\u0627\u0644\u062A\u0646\u0638\u064A\u0641 \u0628\u0639\u062F: <b>${stats2.settings.cleanupInactiveDays} \u064A\u0648\u0645\u0627\u064B</b>`;
 }
 async function sendAdminPanel(chatId, telegramId) {
   ownerStack(telegramId).length = 0;
@@ -3369,7 +3942,7 @@ async function handleOwnerButton(message, text2) {
     return sendLimitsPage(chatId);
   }
   if (text2 === "\u{1F4CB} \u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u062D\u0632\u0645") {
-    await sendMessage(chatId, planListText(await listSubscriptionPlans()), { replyMarkup: OWNER_LIMITS_KEYBOARD });
+    await sendMessage(chatId, planListText(await listSubscriptionPlans2()), { replyMarkup: OWNER_LIMITS_KEYBOARD });
     return true;
   }
   if (text2 === "\u2705 \u062A\u0634\u063A\u064A\u0644 \u062D\u062F \u0627\u0644\u0627\u0633\u062A\u062E\u062F\u0627\u0645") {
@@ -3433,7 +4006,7 @@ ${escapeHtml(error.message.slice(0, 160))}`).join("\n\n")}` : "\u0644\u0627 \u06
     return true;
   }
   if (text2 === "\u{1F4CB} \u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643") {
-    const subscriptions = await listForcedSubscriptions();
+    const subscriptions = await listForcedSubscriptions2();
     if (!subscriptions.length) {
       await sendMessage(chatId, "\u0644\u0627 \u062A\u0648\u062C\u062F \u0642\u0646\u0648\u0627\u062A \u0627\u0634\u062A\u0631\u0627\u0643 \u0645\u0641\u0631\u0648\u0636\u0629 \u062D\u0627\u0644\u064A\u0627\u064B.", { replyMarkup: OWNER_SUBSCRIPTIONS_KEYBOARD });
       return true;
@@ -3517,7 +4090,7 @@ async function handlePendingAdminInput(message, text2) {
         const stars = Number(text2.trim());
         if (!draft?.name || !draft.days) throw new Error("\u0627\u0628\u062F\u0623 \u0645\u0646 \u062C\u062F\u064A\u062F \u0628\u0637\u0644\u0628 \xAB\u0625\u0636\u0627\u0641\u0629 \u062D\u0632\u0645\u0629\xBB.");
         if (!Number.isInteger(stars) || stars < 1 || stars > 1e5) throw new Error("\u0623\u0631\u0633\u0644 \u0639\u062F\u062F \u0646\u062C\u0648\u0645 \u0635\u062D\u064A\u062D\u0627\u064B \u0628\u064A\u0646 1 \u0648100000.");
-        const plan = await addSubscriptionPlan({ name: draft.name, durationDays: draft.days, stars });
+        const plan = await addSubscriptionPlan2({ name: draft.name, durationDays: draft.days, stars });
         planDrafts.delete(telegramId);
         await sendMessage(chatId, planCreatedText(plan), { replyMarkup: OWNER_LIMITS_KEYBOARD });
         await notifyOwners(`\u{1F4B3} <b>\u0625\u0636\u0627\u0641\u0629 \u062D\u0632\u0645\u0629 \u0627\u0634\u062A\u0631\u0627\u0643</b>
@@ -3545,7 +4118,7 @@ async function handlePendingAdminInput(message, text2) {
       await sendMessage(chatId, `\u062A\u0645 \u0636\u0628\u0637 \u0627\u0644\u062A\u0646\u0638\u064A\u0641 \u0628\u0639\u062F <b>${value}</b> \u064A\u0648\u0645\u0627\u064B \u0645\u0646 \u0639\u062F\u0645 \u0627\u0644\u0646\u0634\u0627\u0637.`, { replyMarkup });
     } else if (pending2.action === "addChannel") {
       const parsed = parseSubscriptionTarget(text2);
-      const added = await addForcedSubscription({ target: parsed.target, inviteUrl: parsed.inviteUrl, label: parsed.label, kind: parsed.kind });
+      const added = await addForcedSubscription2({ target: parsed.target, inviteUrl: parsed.inviteUrl, label: parsed.label, kind: parsed.kind });
       if (!added) throw new Error("\u0647\u0630\u0647 \u0627\u0644\u0642\u0646\u0627\u0629/\u0627\u0644\u0628\u0648\u062A \u0645\u0636\u0627\u0641 \u0628\u0627\u0644\u0641\u0639\u0644.");
       await notifyOwners(`\u{1F512} <b>\u0625\u0636\u0627\u0641\u0629 \u0627\u0634\u062A\u0631\u0627\u0643 \u0625\u062C\u0628\u0627\u0631\u064A</b>
 \u0627\u0644\u0646\u0648\u0639: <b>${parsed.kind}</b>
@@ -3554,7 +4127,7 @@ async function handlePendingAdminInput(message, text2) {
       await sendMessage(chatId, `\u2705 \u062A\u0645\u062A \u0625\u0636\u0627\u0641\u0629 \xAB<b>${escapeHtml(parsed.label)}</b>\xBB \u0625\u0644\u0649 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643 \u0627\u0644\u0625\u062C\u0628\u0627\u0631\u064A.
 \u0633\u064A\u064F\u0637\u0644\u0628 \u0645\u0646 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646 \u0627\u0644\u0627\u0646\u0636\u0645\u0627\u0645 \u0642\u0628\u0644 \u0627\u0633\u062A\u062E\u062F\u0627\u0645 \u0627\u0644\u0628\u0648\u062A.`, { replyMarkup });
     } else if (pending2.action === "removeChannel") {
-      const removed = await removeForcedSubscription(text2);
+      const removed = await removeForcedSubscription2(text2);
       if (!removed) throw new Error("\u0644\u0645 \u064A\u062A\u0645 \u0627\u0644\u0639\u062B\u0648\u0631 \u0639\u0644\u0649 \u0647\u0630\u0627 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643. \u062A\u062D\u0642\u0642 \u0645\u0646 \u0627\u0644\u0645\u0639\u0631\u0651\u0641.");
       await notifyOwners(`\u{1F513} <b>\u0625\u0632\u0627\u0644\u0629 \u0627\u0634\u062A\u0631\u0627\u0643 \u0625\u062C\u0628\u0627\u0631\u064A</b>
 \u0627\u0644\u0645\u0639\u0631\u0651\u0641: <code>${escapeHtml(text2.trim())}</code>`);
@@ -3570,7 +4143,7 @@ async function handlePendingAdminInput(message, text2) {
       await updateUsageLimit({ windowHours: value });
       await sendMessage(chatId, `\u062A\u0645 \u0636\u0628\u0637 \u0646\u0627\u0641\u0630\u0629 \u0627\u0644\u062D\u062F: <b>${value}</b> \u0633\u0627\u0639\u0629.`, { replyMarkup });
     } else if (pending2.action === "stopPlan") {
-      const stopped2 = await setSubscriptionPlanActive(text2, false);
+      const stopped2 = await setSubscriptionPlanActive2(text2, false);
       if (!stopped2) throw new Error("\u0644\u0645 \u064A\u062A\u0645 \u0627\u0644\u0639\u062B\u0648\u0631 \u0639\u0644\u0649 \u062D\u0632\u0645\u0629 \u0628\u0647\u0630\u0627 \u0627\u0644\u0627\u0633\u0645. \u062A\u062D\u0642\u0642 \u0645\u0646 \u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u062D\u0632\u0645.");
       await notifyOwners(`\u26D4 <b>\u0625\u064A\u0642\u0627\u0641 \u062D\u0632\u0645\u0629</b>
 \u0627\u0644\u062D\u0632\u0645\u0629: <b>${escapeHtml(text2.trim())}</b>`);
@@ -3605,7 +4178,7 @@ async function handleMessage(message) {
   const text2 = message.text.trim();
   const chatId = String(message.chat.id);
   const telegramId = String(message.from.id);
-  const role = await getOwnerRole(telegramId);
+  const role = await getOwnerRole2(telegramId);
   if (!role && !admission.primary) {
     const missing = await checkForcedSubscriptions(telegramId);
     if (missing.length) {
@@ -3666,7 +4239,7 @@ async function handleSuccessfulPayment(message) {
   const chatId = String(message.chat.id);
   const primary = await isPrimaryOwner(telegramId);
   const planId = payment.invoice_payload.replace(/^sub:/, "");
-  const plan = await findSubscriptionPlanById(planId);
+  const plan = await findSubscriptionPlanById2(planId);
   if (!plan) {
     return sendMessage(chatId, "\u062A\u0645 \u0627\u0633\u062A\u0644\u0627\u0645 \u0645\u062F\u0641\u0648\u0639\u0627\u062A\u0643\u060C \u0644\u0643\u0646 \u062A\u0639\u0630\u0631 \u0627\u0644\u062A\u0639\u0631\u0641 \u0639\u0644\u0649 \u0627\u0644\u062D\u0632\u0645\u0629. \u062A\u0648\u0627\u0635\u0644 \u0645\u0639 \u0627\u0644\u0645\u0627\u0644\u0643.", { replyMarkup: keyboardFor(primary) });
   }
@@ -3691,7 +4264,7 @@ async function handleSuccessfulPayment(message) {
 }
 async function handlePreCheckoutQuery(query) {
   const planId = query.invoice_payload.replace(/^sub:/, "");
-  const plan = await findSubscriptionPlanById(planId);
+  const plan = await findSubscriptionPlanById2(planId);
   if (!plan || !plan.active) return answerPreCheckoutQuery(query.id, false, "\u0627\u0644\u062D\u0632\u0645\u0629 \u063A\u064A\u0631 \u0645\u062A\u0627\u062D\u0629 \u062D\u0627\u0644\u064A\u0627\u064B.");
   return answerPreCheckoutQuery(query.id, true);
 }
@@ -3739,7 +4312,7 @@ async function handleDownloadCallback(callback) {
   if (data.startsWith("sub_plan:")) {
     if (!allowCallback(senderId)) return answerCallbackQuery(callback.id, "\u{1F4A1} \u0623\u0646\u062A \u062A\u0636\u063A\u0637 \u0628\u0633\u0631\u0639\u0629. \u0627\u0646\u062A\u0638\u0631 \u0642\u0644\u064A\u0644\u0627\u064B \u062B\u0645 \u0623\u0639\u062F \u0627\u0644\u0645\u062D\u0627\u0648\u0644\u0629.");
     const planId = data.slice("sub_plan:".length);
-    const plan = await findSubscriptionPlanById(planId);
+    const plan = await findSubscriptionPlanById2(planId);
     if (!plan || !plan.active) return answerCallbackQuery(callback.id, "\u0627\u0644\u062D\u0632\u0645\u0629 \u063A\u064A\u0631 \u0645\u062A\u0627\u062D\u0629 \u062D\u0627\u0644\u064A\u0627\u064B");
     await answerCallbackQuery(callback.id, "\u062C\u0627\u0631\u064D \u062A\u062C\u0647\u064A\u0632 \u0641\u0627\u062A\u0648\u0631\u0629 \u0627\u0644\u062F\u0641\u0639 \u2B50\u2026");
     try {
@@ -3771,7 +4344,7 @@ async function handleDownloadCallback(callback) {
     if (!subscribed) {
       const used = await userDownloadsInWindow(senderId, settings.usageLimitWindowHours);
       if (used >= settings.usageLimitCount) {
-        const plans = await listSubscriptionPlans();
+        const plans = await listSubscriptionPlans2();
         const hasActivePlans = plans.some((plan) => plan.active);
         await answerCallbackQuery(callback.id, hasActivePlans ? "\u0627\u0646\u062A\u0647\u062A \u062D\u0635\u062A\u0643 \u0627\u0644\u0645\u062C\u0627\u0646\u064A\u0629" : "\u0627\u0646\u062A\u0647\u062A \u062D\u0635\u062A\u0643 \u0627\u0644\u064A\u0648\u0645\u064A\u0629");
         if (hasActivePlans && settings.paidModeEnabled) {
@@ -4000,6 +4573,7 @@ function registerTelegramCleanupRoute(app) {
 
 // server/_core/index.ts
 init_botDb();
+init_supabase();
 function isPortAvailable(port) {
   return new Promise((resolve) => {
     const server = net2.createServer();
@@ -4035,6 +4609,7 @@ async function startServer() {
   const server = createServer(app);
   configureTrustProxy(app);
   await cleanupStaleJobs();
+  await initializeSupabaseStorage().catch((error) => console.error("[Supabase] init failed", error));
   app.use(express2.json({ limit: "50mb" }));
   app.use(express2.urlencoded({ limit: "50mb", extended: true }));
   registerStorageProxy(app);

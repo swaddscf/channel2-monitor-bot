@@ -11,6 +11,7 @@ import { serveStatic } from "./serveStatic";
 import { registerTelegramRoutes } from "../telegram/routes";
 import { registerTelegramCleanupRoute } from "../telegram/cleanupRoute";
 import { cleanupStaleJobs } from "../telegram/botDb";
+import { initializeSupabaseStorage } from "../telegram/supabase";
 import { isPollingEnabled, startTelegramPolling } from "../telegram/polling";
 
 function isPortAvailable(port: number): Promise<boolean> {
@@ -53,6 +54,8 @@ async function startServer() {
   configureTrustProxy(app);
   // Drop any in-flight jobs left behind by a previous process.
   await cleanupStaleJobs();
+  // Initialize shared Supabase/Postgres storage and cross-instance dedup when configured.
+  await initializeSupabaseStorage().catch(error => console.error("[Supabase] init failed", error));
   // Configure body parser with larger size limit for file uploads
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));

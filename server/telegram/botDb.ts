@@ -2,6 +2,35 @@ import { nanoid } from "nanoid";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { cleanupInactiveBefore, isValidCleanupDays, isValidUsageLimitCount, isValidUsageWindowHours } from "./policy";
+import {
+  addForcedSubscription as addForcedSubscriptionPg,
+  addOwner as addOwnerPg,
+  addSubscriptionPlan as addSubscriptionPlanPg,
+  activeRecipientIds as activeRecipientIdsPg,
+  claimUpdate as claimUpdatePg,
+  ensurePrimaryOwnerWeb as ensurePrimaryOwnerPg,
+  findSubscriptionPlanById as findSubscriptionPlanByIdPg,
+  findUserByUsername as findUserByUsernamePg,
+  getAccessRecord as getAccessRecordPg,
+  getOwnerRole as getOwnerRolePg,
+  getSettings as getSettingsPg,
+  getUser as getUserPg,
+  isSupabaseConfigured,
+  listForcedSubscriptions as listForcedSubscriptionsPg,
+  listOwners as listOwnersPg,
+  listSubscriptionPlans as listSubscriptionPlansPg,
+  listUsers as listUsersPg,
+  pruneUsers as pruneUsersPg,
+  removeForcedSubscription as removeForcedSubscriptionPg,
+  removeOwner as removeOwnerPg,
+  saveAccessRecord as saveAccessRecordPg,
+  saveSettings as saveSettingsPg,
+  setSubscriptionPlanActive as setSubscriptionPlanActivePg,
+  setUserStatus as setUserStatusPg,
+  stats as statsPg,
+  touchUser as touchUserPg,
+  trimClaims as trimClaimsPg,
+} from "./supabase";
 import type { ForcedSubscription, SubscriptionPlan } from "./types";
 import type { TelegramFrom } from "./types";
 
@@ -223,14 +252,24 @@ export function resetBotMemoryStore() {
   accessPersistenceReady = undefined;
 }
 
+async function ownerRole(telegramId: string): Promise<"primary" | "owner" | undefined> {
+  if (isSupabaseConfigured()) return getOwnerRolePg(telegramId);
+  return store.owners.get(String(telegramId))?.role;
+}
+
 export async function ensureBotSettings() {
   ensurePrimaryOwner();
+  if (isSupabaseConfigured()) return getSettingsPg();
   return cloneSetting();
 }
 
 export async function ensurePrimaryOwner() {
   const ownerId = configuredPrimaryOwnerId();
   if (!ownerId) return;
+  if (isSupabaseConfigured()) {
+    await ensurePrimaryOwnerPg(ownerId);
+    return;
+  }
   const existing = store.owners.get(ownerId);
   if (!existing) {
     store.owners.set(ownerId, { id: store.nextUserId++, telegramId: ownerId, role: "primary", addedAt: new Date(), addedByTelegramId: ownerId });
@@ -242,18 +281,19 @@ export async function ensurePrimaryOwner() {
 }
 
 export async function getOwnerRole(telegramId: string) {
-  return store.owners.get(String(telegramId))?.role;
+  return ownerRole(telegramId);
 }
 
 export async function isOwner(telegramId: string) {
-  return Boolean(store.owners.get(String(telegramId)));
+  return Boolean(await ownerRole(telegramId));
 }
 
 export async function isPrimaryOwner(telegramId: string) {
-  return store.owners.get(String(telegramId))?.role === "primary";
+  return (await ownerRole(telegramId)) === "primary";
 }
 
 export async function touchAndAdmitUser(from: TelegramFrom): Promise<{ admission: Admission; isNew: boolean }> {
+  if (isSupabaseConfigured()) return touchUserPg(from);
   const telegramId = String(from.id);
   const displayName = [from.first_name, from.last_name].filter(Boolean).join(" ").slice(0, 160) || "مستخدم";
   const existing = store.users.get(telegramId);
@@ -338,6 +378,12 @@ export async function cancelLatestActiveJob(telegramId: string) {
 
 export async function claimTelegramUpdate(updateId: number) {
   if (store.processedUpdateIds.has(updateId)) return false;
+  if (isSupabaseConfigured()) {
+    const fresh = await claimUpdatePg(updateId);
+    if (!fresh) return false;
+    store.processedUpdateIds.add(updateId);
+    return true;
+  }
   store.processedUpdateIds.add(updateId);
   return true;
 }
@@ -354,6 +400,12 @@ export async function recordBotError(input: { telegramId?: string; sourceUrl?: s
 }
 
 export async function botStats() {
+  if (isSupabaseConfigured()) {
+    const settings = await getSettingsPg();
+    const dayStart = new Date(); dayStart.setUTCHours(0, 0, 0, 0);
+    const inactiveBefore = new Date(Date.now() - settings.cleanupInactiveDays * 86_400_000);
+    return { ...(await statsPg(inactiveBefore, dayStart)), settings };
+  }
   const dayStart = new Date(); dayStart.setUTCHours(0, 0, 0, 0);
   const inactiveBefore = new Date(Date.now() - store.settings.cleanupInactiveDays * 86_400_000);
   const all = Array.from(store.users.values());
@@ -368,6 +420,11 @@ export async function botStats() {
 }
 
 export async function listTelegramUsers(kind: "recent" | "active" | "blocked" | "inactive", limit = 50) {
+  if (isSupabaseConfigured()) {
+    const settings = await getSettingsPg();
+    const inactiveBefore = new Date(Date.now() - settings.cleanupInactiveDays * 86_400_000);
+    return listUsersPg(kind, limit, inactiveBefore);
+  }
   const inactiveBefore = new Date(Date.now() - store.settings.cleanupInactiveDays * 86_400_000);
   const all = Array.from(store.users.values());
   const filtered = kind === "active" ? all.filter(user => user.status === "active")
@@ -381,11 +438,16 @@ export async function listTelegramUsers(kind: "recent" | "active" | "blocked" | 
 }
 
 export async function getTelegramUser(telegramId: string) {
+  if (isSupabaseConfigured()) return getUserPg(telegramId);
   return store.users.get(String(telegramId));
 }
 
 export async function findTelegramUser(identifier: string) {
   const normalized = identifier.trim().replace(/^@/, "");
+  if (isSupabaseConfigured()) {
+    if (/^\d+$/.test(normalized)) return getUserPg(normalized);
+    return findUserByUsernamePg(normalized);
+  }
   if (/^\d+$/.test(normalized)) {
     return store.users.get(normalized);
   }
@@ -397,6 +459,12 @@ export async function findTelegramUser(identifier: string) {
 }
 
 export async function setTelegramUserBlocked(identifier: string, blocked: boolean) {
+  if (isSupabaseConfigured()) {
+    const normalized = identifier.trim().replace(/^@/, "");
+    if (/^\d+$/.test(normalized)) return setUserStatusPg(normalized, blocked);
+    const user = await findUserByUsernamePg(normalized);
+    return user ? setUserStatusPg(user.telegramId, blocked) : undefined;
+  }
   if (/^\d+$/.test(identifier.trim())) {
     const user = store.users.get(identifier.trim());
     if (!user) return undefined;
@@ -410,12 +478,14 @@ export async function setTelegramUserBlocked(identifier: string, blocked: boolea
 }
 
 export async function listOwners() {
+  if (isSupabaseConfigured()) return listOwnersPg();
   return Array.from(store.owners.values()).sort((a, b) => b.addedAt.getTime() - a.addedAt.getTime());
 }
 
 export async function addOwner(telegramId: string, addedByTelegramId: string) {
   const normalized = telegramId.trim();
   if (!/^\d+$/.test(normalized)) throw new Error("أدخل معرّف تلغرام رقمي صحيح.");
+  if (isSupabaseConfigured()) return addOwnerPg(normalized, addedByTelegramId);
   if (store.owners.has(normalized)) return false;
   store.owners.set(normalized, {
     id: store.nextUserId++,
@@ -428,6 +498,11 @@ export async function addOwner(telegramId: string, addedByTelegramId: string) {
 }
 
 export async function removeOwner(telegramId: string) {
+  if (isSupabaseConfigured()) {
+    const result = await removeOwnerPg(telegramId);
+    if (result === "primary") throw new Error("لا يمكن حذف المالك الأساسي.");
+    return Boolean(result);
+  }
   const owner = store.owners.get(telegramId);
   if (owner?.role === "primary") throw new Error("لا يمكن حذف المالك الأساسي.");
   if (!owner) return false;
@@ -437,10 +512,32 @@ export async function removeOwner(telegramId: string) {
 
 export async function updateCleanupInactiveDays(days: number) {
   if (!isValidCleanupDays(days)) throw new Error("مدة التنظيف يجب أن تكون بين 7 و365 يوماً.");
+  if (isSupabaseConfigured()) {
+    const settings = await getSettingsPg();
+    settings.cleanupInactiveDays = days;
+    settings.updatedAt = new Date();
+    await saveSettingsPg(settings);
+    return;
+  }
   store.settings = { ...store.settings, cleanupInactiveDays: days, updatedAt: new Date() };
 }
 
 export async function updateUsageLimit(input: { enabled?: boolean; count?: number; windowHours?: number }) {
+  if (isSupabaseConfigured()) {
+    const settings = await getSettingsPg();
+    if (input.enabled !== undefined) settings.usageLimitEnabled = input.enabled;
+    if (input.count !== undefined) {
+      if (!isValidUsageLimitCount(input.count)) throw new Error("عدد التنزيلات يجب أن يكون رقماً بين 1 و1000.");
+      settings.usageLimitCount = input.count;
+    }
+    if (input.windowHours !== undefined) {
+      if (!isValidUsageWindowHours(input.windowHours)) throw new Error("نافذة الحد يجب أن تكون ساعات بين 1 و8760.");
+      settings.usageLimitWindowHours = input.windowHours;
+    }
+    settings.updatedAt = new Date();
+    await saveSettingsPg(settings);
+    return;
+  }
   const next = { ...store.settings, updatedAt: new Date() };
   if (input.enabled !== undefined) next.usageLimitEnabled = input.enabled;
   if (input.count !== undefined) {
@@ -455,6 +552,13 @@ export async function updateUsageLimit(input: { enabled?: boolean; count?: numbe
 }
 
 export async function updatePaidMode(enabled: boolean) {
+  if (isSupabaseConfigured()) {
+    const settings = await getSettingsPg();
+    settings.paidModeEnabled = enabled;
+    settings.updatedAt = new Date();
+    await saveSettingsPg(settings);
+    return;
+  }
   store.settings = { ...store.settings, paidModeEnabled: enabled, updatedAt: new Date() };
 }
 
@@ -464,12 +568,31 @@ export async function recentErrors(limit = 20) {
 
 export async function cleanupBotData() {
   const now = Date.now();
+  if (isSupabaseConfigured()) {
+    const settings = await getSettingsPg();
+    const inactiveBefore = cleanupInactiveBefore(settings.cleanupInactiveDays, now);
+    const ownerIds = (await listOwnersPg()).map(owner => owner.telegramId);
+    const removedIds = await pruneUsersPg(inactiveBefore, ownerIds);
+    const removed = new Set(removedIds);
+    store.jobs.forEach((job, id) => {
+      if (removed.has(job.telegramId)) store.jobs.delete(id);
+    });
+    store.errors = store.errors.filter(error => !removed.has(String(error.telegramId)));
+    store.jobs.forEach((job, id) => {
+      if (job.expiresAt.getTime() < now) store.jobs.delete(id);
+    });
+    store.errors = store.errors.filter(error => error.createdAt.getTime() >= now - 30 * 86_400_000);
+    store.processedUpdateIds.clear();
+    await trimClaimsPg(new Date(now - 7 * 86_400_000));
+    return { removedInactiveUsers: removedIds.length };
+  }
   const inactiveBefore = cleanupInactiveBefore(store.settings.cleanupInactiveDays, now);
   const ownerIds = new Set(store.owners.keys());
   const staleUsers = Array.from(store.users.values())
     .filter(user => user.status === "active" && user.lastActivityAt < inactiveBefore && !ownerIds.has(user.telegramId));
   for (const user of staleUsers) {
     store.users.delete(user.telegramId);
+    store.access.delete(user.telegramId);
     store.jobs.forEach(job => {
       if (job.telegramId === user.telegramId) store.jobs.delete(job.id);
     });
@@ -485,17 +608,23 @@ export async function cleanupBotData() {
 }
 
 export async function activeRecipients() {
+  if (isSupabaseConfigured()) {
+    const ids = await activeRecipientIdsPg();
+    return ids.map(telegramId => ({ telegramId }));
+  }
   return Array.from(store.users.values())
     .filter(user => user.status === "active")
     .map(user => ({ telegramId: user.telegramId }));
 }
 
 export async function listForcedSubscriptions() {
+  if (isSupabaseConfigured()) return listForcedSubscriptionsPg();
   await ensureSubscriptionsLoaded();
   return Array.from(store.subscriptions.values()).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
 }
 
 export async function addForcedSubscription(input: Omit<ForcedSubscription, "id" | "createdAt">) {
+  if (isSupabaseConfigured()) return addForcedSubscriptionPg(input);
   await ensureSubscriptionsLoaded();
   const normalized = input.target.trim();
   const existing = Array.from(store.subscriptions.values()).find(subscription => subscription.target === normalized);
@@ -512,6 +641,13 @@ export async function addForcedSubscription(input: Omit<ForcedSubscription, "id"
 }
 
 export async function removeForcedSubscription(identifier: string) {
+  if (isSupabaseConfigured()) {
+    const subscriptions = await listForcedSubscriptionsPg();
+    const cleaned = identifier.trim().replace(/^https:\/\/t\.me\//, "").replace(/^@/, "");
+    const subscription = subscriptions.find(candidate => candidate.id === identifier.trim() || candidate.target === cleaned || candidate.label === identifier.trim());
+    if (!subscription) return false;
+    return removeForcedSubscriptionPg(subscription.id);
+  }
   await ensureSubscriptionsLoaded();
   const cleaned = identifier.trim().replace(/^https:\/\/t\.me\//, "").replace(/^@/, "");
   const subscription = Array.from(store.subscriptions.values())
@@ -523,6 +659,11 @@ export async function removeForcedSubscription(identifier: string) {
 }
 
 export async function findForcedSubscription(target: string) {
+  if (isSupabaseConfigured()) {
+    const normalized = target.replace(/^@/, "");
+    const subscriptions = await listForcedSubscriptionsPg();
+    return subscriptions.find(subscription => subscription.target.replace(/^@/, "") === normalized);
+  }
   await ensureSubscriptionsLoaded();
   const normalized = target.replace(/^@/, "");
   return Array.from(store.subscriptions.values()).find(subscription => subscription.target.replace(/^@/, "") === normalized);
@@ -545,7 +686,13 @@ function accessRecord(telegramId: string) {
   return record;
 }
 
+async function persistAccess(telegramId: string, record: UserAccessRecord) {
+  if (isSupabaseConfigured()) return saveAccessRecordPg(telegramId, record);
+  await saveAccessToDisk();
+}
+
 export async function getUserAccess(telegramId: string): Promise<UserAccessRecord> {
+  if (isSupabaseConfigured()) return getAccessRecordPg(String(telegramId));
   await ensureAccessLoaded();
   return accessRecord(String(telegramId));
 }
@@ -561,25 +708,27 @@ export async function recordUserDownload(telegramId: string, windowHours: number
   const since = Date.now() - windowHours * 3_600_000;
   record.downloadTimestamps.push(Date.now());
   record.downloadTimestamps = record.downloadTimestamps.filter(timestamp => timestamp >= since);
-  await saveAccessToDisk();
+  await persistAccess(telegramId, record);
 }
 
 export async function setUserSubscription(telegramId: string, expiresAt: number, planId: string | null) {
   const record = await getUserAccess(telegramId);
   record.subscriptionExpiresAt = expiresAt;
   record.subscriptionPlanId = planId;
-  await saveAccessToDisk();
+  await persistAccess(telegramId, record);
 }
 
 export async function listSubscriptionPlans() {
+  if (isSupabaseConfigured()) return listSubscriptionPlansPg();
   await ensureAccessLoaded();
   return Array.from(store.plans.values()).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
 }
 
 export async function addSubscriptionPlan(input: { name: string; durationDays: number; stars: number }) {
-  await ensureAccessLoaded();
   const name = input.name.trim().slice(0, 60);
   if (!name) throw new Error("اكتب اسماً للحزمة.");
+  if (isSupabaseConfigured()) return addSubscriptionPlanPg({ ...input, name });
+  await ensureAccessLoaded();
   const plan: SubscriptionPlan = {
     id: nanoid(12),
     name,
@@ -594,11 +743,19 @@ export async function addSubscriptionPlan(input: { name: string; durationDays: n
 }
 
 export async function findSubscriptionPlanById(id: string) {
+  if (isSupabaseConfigured()) return findSubscriptionPlanByIdPg(id);
   await ensureAccessLoaded();
   return store.plans.get(id);
 }
 
 export async function setSubscriptionPlanActive(identifier: string, active: boolean) {
+  if (isSupabaseConfigured()) {
+    const cleaned = identifier.trim().replace(/^@/, "");
+    const plans = await listSubscriptionPlansPg();
+    const plan = plans.find(candidate => candidate.id === cleaned || candidate.name === cleaned || candidate.name.replace(/^@/, "") === cleaned);
+    if (!plan) return false;
+    return setSubscriptionPlanActivePg(plan.id, active);
+  }
   await ensureAccessLoaded();
   const cleaned = identifier.trim().replace(/^@/, "");
   const plan = Array.from(store.plans.values())

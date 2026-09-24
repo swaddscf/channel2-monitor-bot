@@ -29,7 +29,8 @@ RUN echo '{ \
     "nanoid":"^5.1.0", \
     "axios":"^1.12.0", \
     "drizzle-orm":"^0.44.0", \
-    "mysql2":"^3.15.0" \
+    "mysql2":"^3.15.0", \
+    "pg":"^8.13.0" \
   } \
 }' > package.json \
   && npm install --omit=dev --legacy-peer-deps --maxsockets=2 \

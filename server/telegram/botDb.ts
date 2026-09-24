@@ -1,8 +1,8 @@
 import { nanoid } from "nanoid";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { cleanupInactiveBefore, isValidCleanupDays } from "./policy";
-import type { ForcedSubscription } from "./types";
+import { cleanupInactiveBefore, isValidCleanupDays, isValidUsageLimitCount, isValidUsageWindowHours } from "./policy";
+import type { ForcedSubscription, SubscriptionPlan } from "./types";
 import type { TelegramFrom } from "./types";
 
 const DEFAULT_SETTINGS = {
@@ -11,6 +11,10 @@ const DEFAULT_SETTINGS = {
   cleanupTempMinutes: 60,
   broadcastRatePerSecond: 20,
   notifyNewUsers: true,
+  usageLimitEnabled: false,
+  usageLimitCount: 5,
+  usageLimitWindowHours: 24,
+  paidModeEnabled: false,
 };
 
 export type Admission = "active" | "blocked" | "capacity";
@@ -22,7 +26,17 @@ export type MemoryBotSettings = {
   cleanupTempMinutes: number;
   broadcastRatePerSecond: number;
   notifyNewUsers: boolean;
+  usageLimitEnabled: boolean;
+  usageLimitCount: number;
+  usageLimitWindowHours: number;
+  paidModeEnabled: boolean;
   updatedAt: Date;
+};
+
+export type UserAccessRecord = {
+  subscriptionExpiresAt: number | null;
+  subscriptionPlanId: string | null;
+  downloadTimestamps: number[];
 };
 
 export type MemoryBotUser = {
@@ -79,6 +93,8 @@ const store = {
   jobs: new Map<string, MemoryBotJob>(),
   errors: [] as MemoryBotError[],
   subscriptions: new Map<string, ForcedSubscription>(),
+  plans: new Map<string, SubscriptionPlan>(),
+  access: new Map<string, UserAccessRecord>(),
   processedUpdateIds: new Set<number>(),
   nextUserId: 1,
   nextErrorId: 1,
@@ -89,8 +105,15 @@ function subscriptionsFile() {
   return path.join(dir, "subscriptions.json");
 }
 
+function accessFile() {
+  const dir = process.env.DATA_DIR?.trim() || path.join(process.cwd(), "data");
+  return path.join(dir, "access.json");
+}
+
 let subscriptionsPersistenceReady: Promise<void> | undefined;
 let subscriptionsWriteChain: Promise<void> = Promise.resolve();
+let accessPersistenceReady: Promise<void> | undefined;
+let accessWriteChain: Promise<void> = Promise.resolve();
 
 async function loadSubscriptionsFromDisk() {
   try {
@@ -127,6 +150,59 @@ function ensureSubscriptionsLoaded() {
   return subscriptionsPersistenceReady;
 }
 
+type AccessFileShape = {
+  plans: SubscriptionPlan[];
+  users: Record<string, UserAccessRecord>;
+};
+
+async function loadAccessFromDisk() {
+  try {
+    const raw = await readFile(accessFile(), "utf8");
+    const parsed = JSON.parse(raw) as Partial<AccessFileShape>;
+    if (Array.isArray(parsed.plans)) {
+      store.plans.clear();
+      parsed.plans.forEach(plan => store.plans.set(plan.id, { ...plan, createdAt: new Date(plan.createdAt) }));
+    }
+    if (parsed.users && typeof parsed.users === "object") {
+      store.access.clear();
+      Object.entries(parsed.users).forEach(([telegramId, record]) => {
+        store.access.set(telegramId, {
+          subscriptionExpiresAt: record.subscriptionExpiresAt ?? null,
+          subscriptionPlanId: record.subscriptionPlanId ?? null,
+          downloadTimestamps: Array.isArray(record.downloadTimestamps) ? record.downloadTimestamps.filter(value => typeof value === "number") : [],
+        });
+      });
+    }
+  } catch {
+    try {
+      await mkdir(path.dirname(accessFile()), { recursive: true });
+      await saveAccessToDisk();
+    } catch { /* persistence is best-effort */ }
+  }
+}
+
+function saveAccessToDisk() {
+  accessWriteChain = accessWriteChain.then(async () => {
+    const shape: AccessFileShape = {
+      plans: Array.from(store.plans.values()),
+      users: Object.fromEntries(store.access.entries()),
+    };
+    const data = JSON.stringify(shape, null, 2);
+    try {
+      await mkdir(path.dirname(accessFile()), { recursive: true });
+      await writeFile(accessFile(), data, "utf8");
+    } catch { /* persistence is best-effort */ }
+  });
+  return accessWriteChain.catch(() => undefined);
+}
+
+function ensureAccessLoaded() {
+  if (!accessPersistenceReady) {
+    accessPersistenceReady = loadAccessFromDisk();
+  }
+  return accessPersistenceReady;
+}
+
 function cloneSetting() {
   return { ...store.settings };
 }
@@ -138,10 +214,13 @@ export function resetBotMemoryStore() {
   store.jobs.clear();
   store.errors = [];
   store.subscriptions.clear();
+  store.plans.clear();
+  store.access.clear();
   store.processedUpdateIds.clear();
   store.nextUserId = 1;
   store.nextErrorId = 1;
   subscriptionsPersistenceReady = undefined;
+  accessPersistenceReady = undefined;
 }
 
 export async function ensureBotSettings() {
@@ -361,6 +440,24 @@ export async function updateCleanupInactiveDays(days: number) {
   store.settings = { ...store.settings, cleanupInactiveDays: days, updatedAt: new Date() };
 }
 
+export async function updateUsageLimit(input: { enabled?: boolean; count?: number; windowHours?: number }) {
+  const next = { ...store.settings, updatedAt: new Date() };
+  if (input.enabled !== undefined) next.usageLimitEnabled = input.enabled;
+  if (input.count !== undefined) {
+    if (!isValidUsageLimitCount(input.count)) throw new Error("عدد التنزيلات يجب أن يكون رقماً بين 1 و1000.");
+    next.usageLimitCount = input.count;
+  }
+  if (input.windowHours !== undefined) {
+    if (!isValidUsageWindowHours(input.windowHours)) throw new Error("نافذة الحد يجب أن تكون ساعات بين 1 و8760.");
+    next.usageLimitWindowHours = input.windowHours;
+  }
+  store.settings = next;
+}
+
+export async function updatePaidMode(enabled: boolean) {
+  store.settings = { ...store.settings, paidModeEnabled: enabled, updatedAt: new Date() };
+}
+
 export async function recentErrors(limit = 20) {
   return [...store.errors].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime()).slice(0, limit);
 }
@@ -438,4 +535,76 @@ export async function cleanupStaleJobs() {
       store.jobs.delete(id);
     }
   });
+}
+
+function accessRecord(telegramId: string) {
+  const existing = store.access.get(telegramId);
+  if (existing) return existing;
+  const record: UserAccessRecord = { subscriptionExpiresAt: null, subscriptionPlanId: null, downloadTimestamps: [] };
+  store.access.set(telegramId, record);
+  return record;
+}
+
+export async function getUserAccess(telegramId: string): Promise<UserAccessRecord> {
+  await ensureAccessLoaded();
+  return accessRecord(String(telegramId));
+}
+
+export async function userDownloadsInWindow(telegramId: string, windowHours: number) {
+  const record = await getUserAccess(telegramId);
+  const since = Date.now() - windowHours * 3_600_000;
+  return record.downloadTimestamps.filter(timestamp => timestamp >= since).length;
+}
+
+export async function recordUserDownload(telegramId: string, windowHours: number) {
+  const record = await getUserAccess(telegramId);
+  const since = Date.now() - windowHours * 3_600_000;
+  record.downloadTimestamps.push(Date.now());
+  record.downloadTimestamps = record.downloadTimestamps.filter(timestamp => timestamp >= since);
+  await saveAccessToDisk();
+}
+
+export async function setUserSubscription(telegramId: string, expiresAt: number, planId: string | null) {
+  const record = await getUserAccess(telegramId);
+  record.subscriptionExpiresAt = expiresAt;
+  record.subscriptionPlanId = planId;
+  await saveAccessToDisk();
+}
+
+export async function listSubscriptionPlans() {
+  await ensureAccessLoaded();
+  return Array.from(store.plans.values()).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+}
+
+export async function addSubscriptionPlan(input: { name: string; durationDays: number; stars: number }) {
+  await ensureAccessLoaded();
+  const name = input.name.trim().slice(0, 60);
+  if (!name) throw new Error("اكتب اسماً للحزمة.");
+  const plan: SubscriptionPlan = {
+    id: nanoid(12),
+    name,
+    durationDays: input.durationDays,
+    stars: input.stars,
+    active: true,
+    createdAt: new Date(),
+  };
+  store.plans.set(plan.id, plan);
+  await saveAccessToDisk();
+  return plan;
+}
+
+export async function findSubscriptionPlanById(id: string) {
+  await ensureAccessLoaded();
+  return store.plans.get(id);
+}
+
+export async function setSubscriptionPlanActive(identifier: string, active: boolean) {
+  await ensureAccessLoaded();
+  const cleaned = identifier.trim().replace(/^@/, "");
+  const plan = Array.from(store.plans.values())
+    .find(candidate => candidate.id === cleaned || candidate.name === cleaned || candidate.name.replace(/^@/, "") === cleaned);
+  if (!plan) return false;
+  store.plans.set(plan.id, { ...plan, active });
+  await saveAccessToDisk();
+  return true;
 }

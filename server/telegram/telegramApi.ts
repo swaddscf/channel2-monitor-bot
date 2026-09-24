@@ -188,8 +188,8 @@ export async function setWebhook(webhookUrl: string, secretToken: string) {
     "setWebhook",
     JSON.stringify({
       url: webhookUrl,
-      secret_token: secretToken,
-      allowed_updates: ["message", "callback_query"],
+secret_token: secretToken,
+      allowed_updates: ["message", "callback_query", "pre_checkout_query"],
       max_connections: 10,
     }),
   );
@@ -209,9 +209,33 @@ export async function getUpdates(offset?: number, timeoutSeconds = 30) {
     JSON.stringify({
       offset,
       timeout: timeoutSeconds,
-      allowed_updates: ["message", "callback_query"],
+      allowed_updates: ["message", "callback_query", "pre_checkout_query"],
     }),
     { "content-type": "application/json" },
     (timeoutSeconds + 10) * 1_000,
+  );
+}
+
+export async function sendInvoice(chatId: string, input: { title: string; description: string; payload: string; stars: number }) {
+  return telegramRequest<{ id: string; title: string; description: string; currency: string; total_amount: number }>(
+    "sendInvoice",
+    JSON.stringify({
+      chat_id: chatId,
+      title: input.title.slice(0, 32),
+      description: input.description.slice(0, 255),
+      payload: input.payload.slice(0, 128),
+      provider_token: "",
+      currency: "XTR",
+      prices: [{ label: input.title, amount: input.stars }],
+    }),
+    { "content-type": "application/json" },
+  );
+}
+
+export async function answerPreCheckoutQuery(preCheckoutQueryId: string, ok: boolean, errorMessage?: string) {
+  return telegramRequest<boolean>(
+    "answerPreCheckoutQuery",
+    JSON.stringify({ pre_checkout_query_id: preCheckoutQueryId, ok, error_message: errorMessage }),
+    { "content-type": "application/json" },
   );
 }

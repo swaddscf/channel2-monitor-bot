@@ -135,6 +135,20 @@ export const OWNER_USERS_KEYBOARD = {
 export const OWNER_SETTINGS_KEYBOARD = {
   keyboard: [
     [replyButton("⏱️ مدة التنظيف", "primary")],
+    [replyButton("💳 الحدود والاشتراك", "primary")],
+    ...OWNER_FOOTER,
+  ],
+  resize_keyboard: true,
+  is_persistent: true,
+};
+
+export const OWNER_LIMITS_KEYBOARD = {
+  keyboard: [
+    [replyButton("⏱️ عدد التنزيلات", "primary"), replyButton("⏲️ النافذة (ساعات)", "primary")],
+    [replyButton("✅ تشغيل حد الاستخدام", "success"), replyButton("🚫 حد: مجاني", "danger")],
+    [replyButton("💳 وضع البوت: مدفوع", "success"), replyButton("🆓 وضع البوت: مجاني", "danger")],
+    [replyButton("➕ إضافة حزمة", "success"), replyButton("⛔ إيقاف حزمة", "danger")],
+    [replyButton("📋 قائمة الحزم", "primary")],
     ...OWNER_FOOTER,
   ],
   resize_keyboard: true,
@@ -253,5 +267,56 @@ export function mediaChoiceKeyboard(jobId: string, choices: InspectResult["choic
 export function retryTikTokKeyboard(jobId: string) {
   return {
     inline_keyboard: [[inlineButton("🔄 إعادة محاولة TikTok", `retry_tiktok:${jobId}`, "primary")]],
+  };
+}
+
+export function limitsPageText(settings: { usageLimitEnabled: boolean; usageLimitCount: number; usageLimitWindowHours: number; paidModeEnabled: boolean }) {
+  const limit = settings.usageLimitEnabled
+    ? `مفعّل: <b>${settings.usageLimitCount} تنزيل / ${settings.usageLimitWindowHours} ساعة</b>`
+    : "معطّل — <b>مجاني بلا موقت</b>";
+  const mode = settings.paidModeEnabled ? "مدفوع 💳" : "مجاني 🆓";
+  return `💳 <b>الحدود والاشتراك</b>
+
+⏱️ حد الاستخدام: ${limit}
+💳 وضع البوت: <b>${mode}</b>
+
+عند استنفاد الحصة يظهر زر «اشترك» للمستخدم تلقائياً إذا كان الوضع مدفوعاً. تحدد الحزم المدة والسعر بالنجوم ⭐.`;
+}
+
+export function planListText(plans: Array<{ name: string; durationDays: number; stars: number; active: boolean }>) {
+  if (!plans.length) return "📋 لا توجد حزم اشتراك حالياً.\n\nاضغط «➕ إضافة حزمة» لإنشاء أول حزمة أو «توقيفها» باسمها.";
+  const lines = plans.map((plan, index) =>
+    `${index + 1}. ${plan.active ? "✅" : "⛔"} <b>${escapeHtml(plan.name)}</b>\n   المدة: <b>${plan.durationDays} يوم</b> • السعر: <b>${plan.stars} ⭐</b>${plan.active ? "" : " — موقوفة"}`,
+  ).join("\n\n");
+  return `💳 <b>حزم الاشتراك (${plans.length})</b>\n\n${lines}\n\nلإنشاء حزمة اضغط «➕ إضافة حزمة» وتابع الأسئلة.`;
+}
+
+export function planCreatedText(plan: { name: string; durationDays: number; stars: number }) {
+  return `✅ أُضيفت الحزمة بنجاح:
+<b>${escapeHtml(plan.name)}</b>
+المدة: <b>${plan.durationDays} يوم</b>
+السعر: <b>${plan.stars} ⭐</b>`;
+}
+
+export function subscriptionEndsLabel(expiresAt: number) {
+  return new Date(expiresAt).toLocaleDateString("ar-EG", { day: "numeric", month: "long", year: "numeric" });
+}
+
+export function usageLimitExceededText(count: number, windowHours: number, hasPlans: boolean) {
+  const subscribeHint = hasPlans
+    ? "\n\nيمكنك الاشتراك الآن لفتح تنزيلات <b>غير محدودة</b> فوراً."
+    : "";
+  return `⛔ انتهت حصتك من التنزيل
+
+<b>${count} رابــط لكل ${windowHours} ساعة</b> فقط مجاناً.
+سيعود رصيدك تلقائياً بعد مرور النافذة.${subscribeHint}`;
+}
+
+export function subscriptionOfferKeyboard(plans: Array<{ id: string; name: string; durationDays: number; stars: number; active: boolean }>) {
+  return {
+    inline_keyboard: [
+      ...plans.filter(plan => plan.active).map(plan => [inlineButton(`💳 اشترك · ${plan.name} · ${plan.durationDays} يوم · ${plan.stars} ⭐`, `sub_plan:${plan.id}`, "success")]),
+      [inlineButton("✖️ لاحقاً", "sub_dismiss", "danger")],
+    ],
   };
 }

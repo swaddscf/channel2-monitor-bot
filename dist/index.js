@@ -15,6 +15,12 @@ function isValidCleanupDays(value) {
 function cleanupInactiveBefore(days, now = Date.now()) {
   return new Date(now - days * 864e5);
 }
+function isValidUsageLimitCount(value) {
+  return Number.isInteger(value) && value >= 1 && value <= 1e3;
+}
+function isValidUsageWindowHours(value) {
+  return Number.isInteger(value) && value >= 1 && value <= 8760;
+}
 function isValidTelegramUpdateId(value) {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
@@ -30,6 +36,7 @@ __export(botDb_exports, {
   activeRecipients: () => activeRecipients,
   addForcedSubscription: () => addForcedSubscription,
   addOwner: () => addOwner,
+  addSubscriptionPlan: () => addSubscriptionPlan,
   botStats: () => botStats,
   cancelLatestActiveJob: () => cancelLatestActiveJob,
   cancelMediaJob: () => cancelMediaJob,
@@ -41,24 +48,33 @@ __export(botDb_exports, {
   ensureBotSettings: () => ensureBotSettings,
   ensurePrimaryOwner: () => ensurePrimaryOwner,
   findForcedSubscription: () => findForcedSubscription,
+  findSubscriptionPlanById: () => findSubscriptionPlanById,
   findTelegramUser: () => findTelegramUser,
   getMediaJob: () => getMediaJob,
   getOwnerRole: () => getOwnerRole,
   getTelegramUser: () => getTelegramUser,
+  getUserAccess: () => getUserAccess,
   isOwner: () => isOwner,
   isPrimaryOwner: () => isPrimaryOwner,
   listForcedSubscriptions: () => listForcedSubscriptions,
   listOwners: () => listOwners,
+  listSubscriptionPlans: () => listSubscriptionPlans,
   listTelegramUsers: () => listTelegramUsers,
   recentErrors: () => recentErrors,
   recordBotError: () => recordBotError,
+  recordUserDownload: () => recordUserDownload,
   removeForcedSubscription: () => removeForcedSubscription,
   removeOwner: () => removeOwner,
   resetBotMemoryStore: () => resetBotMemoryStore,
+  setSubscriptionPlanActive: () => setSubscriptionPlanActive,
   setTelegramUserBlocked: () => setTelegramUserBlocked,
+  setUserSubscription: () => setUserSubscription,
   touchAndAdmitUser: () => touchAndAdmitUser,
   updateCleanupInactiveDays: () => updateCleanupInactiveDays,
-  updateMediaJob: () => updateMediaJob
+  updateMediaJob: () => updateMediaJob,
+  updatePaidMode: () => updatePaidMode,
+  updateUsageLimit: () => updateUsageLimit,
+  userDownloadsInWindow: () => userDownloadsInWindow
 });
 import { nanoid } from "nanoid";
 import { mkdir, readFile as readFile2, writeFile } from "node:fs/promises";
@@ -69,6 +85,10 @@ function configuredPrimaryOwnerId() {
 function subscriptionsFile() {
   const dir = process.env.DATA_DIR?.trim() || path3.join(process.cwd(), "data");
   return path3.join(dir, "subscriptions.json");
+}
+function accessFile() {
+  const dir = process.env.DATA_DIR?.trim() || path3.join(process.cwd(), "data");
+  return path3.join(dir, "access.json");
 }
 async function loadSubscriptionsFromDisk() {
   try {
@@ -103,6 +123,53 @@ function ensureSubscriptionsLoaded() {
   }
   return subscriptionsPersistenceReady;
 }
+async function loadAccessFromDisk() {
+  try {
+    const raw = await readFile2(accessFile(), "utf8");
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed.plans)) {
+      store.plans.clear();
+      parsed.plans.forEach((plan) => store.plans.set(plan.id, { ...plan, createdAt: new Date(plan.createdAt) }));
+    }
+    if (parsed.users && typeof parsed.users === "object") {
+      store.access.clear();
+      Object.entries(parsed.users).forEach(([telegramId, record]) => {
+        store.access.set(telegramId, {
+          subscriptionExpiresAt: record.subscriptionExpiresAt ?? null,
+          subscriptionPlanId: record.subscriptionPlanId ?? null,
+          downloadTimestamps: Array.isArray(record.downloadTimestamps) ? record.downloadTimestamps.filter((value) => typeof value === "number") : []
+        });
+      });
+    }
+  } catch {
+    try {
+      await mkdir(path3.dirname(accessFile()), { recursive: true });
+      await saveAccessToDisk();
+    } catch {
+    }
+  }
+}
+function saveAccessToDisk() {
+  accessWriteChain = accessWriteChain.then(async () => {
+    const shape = {
+      plans: Array.from(store.plans.values()),
+      users: Object.fromEntries(store.access.entries())
+    };
+    const data = JSON.stringify(shape, null, 2);
+    try {
+      await mkdir(path3.dirname(accessFile()), { recursive: true });
+      await writeFile(accessFile(), data, "utf8");
+    } catch {
+    }
+  });
+  return accessWriteChain.catch(() => void 0);
+}
+function ensureAccessLoaded() {
+  if (!accessPersistenceReady) {
+    accessPersistenceReady = loadAccessFromDisk();
+  }
+  return accessPersistenceReady;
+}
 function cloneSetting() {
   return { ...store.settings };
 }
@@ -113,10 +180,13 @@ function resetBotMemoryStore() {
   store.jobs.clear();
   store.errors = [];
   store.subscriptions.clear();
+  store.plans.clear();
+  store.access.clear();
   store.processedUpdateIds.clear();
   store.nextUserId = 1;
   store.nextErrorId = 1;
   subscriptionsPersistenceReady = void 0;
+  accessPersistenceReady = void 0;
 }
 async function ensureBotSettings() {
   ensurePrimaryOwner();
@@ -300,6 +370,22 @@ async function updateCleanupInactiveDays(days) {
   if (!isValidCleanupDays(days)) throw new Error("\u0645\u062F\u0629 \u0627\u0644\u062A\u0646\u0638\u064A\u0641 \u064A\u062C\u0628 \u0623\u0646 \u062A\u0643\u0648\u0646 \u0628\u064A\u0646 7 \u0648365 \u064A\u0648\u0645\u0627\u064B.");
   store.settings = { ...store.settings, cleanupInactiveDays: days, updatedAt: /* @__PURE__ */ new Date() };
 }
+async function updateUsageLimit(input) {
+  const next = { ...store.settings, updatedAt: /* @__PURE__ */ new Date() };
+  if (input.enabled !== void 0) next.usageLimitEnabled = input.enabled;
+  if (input.count !== void 0) {
+    if (!isValidUsageLimitCount(input.count)) throw new Error("\u0639\u062F\u062F \u0627\u0644\u062A\u0646\u0632\u064A\u0644\u0627\u062A \u064A\u062C\u0628 \u0623\u0646 \u064A\u0643\u0648\u0646 \u0631\u0642\u0645\u0627\u064B \u0628\u064A\u0646 1 \u06481000.");
+    next.usageLimitCount = input.count;
+  }
+  if (input.windowHours !== void 0) {
+    if (!isValidUsageWindowHours(input.windowHours)) throw new Error("\u0646\u0627\u0641\u0630\u0629 \u0627\u0644\u062D\u062F \u064A\u062C\u0628 \u0623\u0646 \u062A\u0643\u0648\u0646 \u0633\u0627\u0639\u0627\u062A \u0628\u064A\u0646 1 \u06488760.");
+    next.usageLimitWindowHours = input.windowHours;
+  }
+  store.settings = next;
+}
+async function updatePaidMode(enabled) {
+  store.settings = { ...store.settings, paidModeEnabled: enabled, updatedAt: /* @__PURE__ */ new Date() };
+}
 async function recentErrors(limit = 20) {
   return [...store.errors].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime()).slice(0, limit);
 }
@@ -367,7 +453,69 @@ async function cleanupStaleJobs() {
     }
   });
 }
-var DEFAULT_SETTINGS, store, subscriptionsPersistenceReady, subscriptionsWriteChain;
+function accessRecord(telegramId) {
+  const existing = store.access.get(telegramId);
+  if (existing) return existing;
+  const record = { subscriptionExpiresAt: null, subscriptionPlanId: null, downloadTimestamps: [] };
+  store.access.set(telegramId, record);
+  return record;
+}
+async function getUserAccess(telegramId) {
+  await ensureAccessLoaded();
+  return accessRecord(String(telegramId));
+}
+async function userDownloadsInWindow(telegramId, windowHours) {
+  const record = await getUserAccess(telegramId);
+  const since = Date.now() - windowHours * 36e5;
+  return record.downloadTimestamps.filter((timestamp2) => timestamp2 >= since).length;
+}
+async function recordUserDownload(telegramId, windowHours) {
+  const record = await getUserAccess(telegramId);
+  const since = Date.now() - windowHours * 36e5;
+  record.downloadTimestamps.push(Date.now());
+  record.downloadTimestamps = record.downloadTimestamps.filter((timestamp2) => timestamp2 >= since);
+  await saveAccessToDisk();
+}
+async function setUserSubscription(telegramId, expiresAt, planId) {
+  const record = await getUserAccess(telegramId);
+  record.subscriptionExpiresAt = expiresAt;
+  record.subscriptionPlanId = planId;
+  await saveAccessToDisk();
+}
+async function listSubscriptionPlans() {
+  await ensureAccessLoaded();
+  return Array.from(store.plans.values()).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+}
+async function addSubscriptionPlan(input) {
+  await ensureAccessLoaded();
+  const name = input.name.trim().slice(0, 60);
+  if (!name) throw new Error("\u0627\u0643\u062A\u0628 \u0627\u0633\u0645\u0627\u064B \u0644\u0644\u062D\u0632\u0645\u0629.");
+  const plan = {
+    id: nanoid(12),
+    name,
+    durationDays: input.durationDays,
+    stars: input.stars,
+    active: true,
+    createdAt: /* @__PURE__ */ new Date()
+  };
+  store.plans.set(plan.id, plan);
+  await saveAccessToDisk();
+  return plan;
+}
+async function findSubscriptionPlanById(id) {
+  await ensureAccessLoaded();
+  return store.plans.get(id);
+}
+async function setSubscriptionPlanActive(identifier, active2) {
+  await ensureAccessLoaded();
+  const cleaned = identifier.trim().replace(/^@/, "");
+  const plan = Array.from(store.plans.values()).find((candidate) => candidate.id === cleaned || candidate.name === cleaned || candidate.name.replace(/^@/, "") === cleaned);
+  if (!plan) return false;
+  store.plans.set(plan.id, { ...plan, active: active2 });
+  await saveAccessToDisk();
+  return true;
+}
+var DEFAULT_SETTINGS, store, subscriptionsPersistenceReady, subscriptionsWriteChain, accessPersistenceReady, accessWriteChain;
 var init_botDb = __esm({
   "server/telegram/botDb.ts"() {
     "use strict";
@@ -377,7 +525,11 @@ var init_botDb = __esm({
       cleanupInactiveDays: 30,
       cleanupTempMinutes: 60,
       broadcastRatePerSecond: 20,
-      notifyNewUsers: true
+      notifyNewUsers: true,
+      usageLimitEnabled: false,
+      usageLimitCount: 5,
+      usageLimitWindowHours: 24,
+      paidModeEnabled: false
     };
     store = {
       settings: { id: 1, ...DEFAULT_SETTINGS, updatedAt: /* @__PURE__ */ new Date() },
@@ -386,11 +538,14 @@ var init_botDb = __esm({
       jobs: /* @__PURE__ */ new Map(),
       errors: [],
       subscriptions: /* @__PURE__ */ new Map(),
+      plans: /* @__PURE__ */ new Map(),
+      access: /* @__PURE__ */ new Map(),
       processedUpdateIds: /* @__PURE__ */ new Set(),
       nextUserId: 1,
       nextErrorId: 1
     };
     subscriptionsWriteChain = Promise.resolve();
+    accessWriteChain = Promise.resolve();
   }
 });
 
@@ -1566,7 +1721,7 @@ async function setWebhook(webhookUrl, secretToken) {
     JSON.stringify({
       url: webhookUrl,
       secret_token: secretToken,
-      allowed_updates: ["message", "callback_query"],
+      allowed_updates: ["message", "callback_query", "pre_checkout_query"],
       max_connections: 10
     })
   );
@@ -1584,10 +1739,32 @@ async function getUpdates(offset, timeoutSeconds = 30) {
     JSON.stringify({
       offset,
       timeout: timeoutSeconds,
-      allowed_updates: ["message", "callback_query"]
+      allowed_updates: ["message", "callback_query", "pre_checkout_query"]
     }),
     { "content-type": "application/json" },
     (timeoutSeconds + 10) * 1e3
+  );
+}
+async function sendInvoice(chatId, input) {
+  return telegramRequest(
+    "sendInvoice",
+    JSON.stringify({
+      chat_id: chatId,
+      title: input.title.slice(0, 32),
+      description: input.description.slice(0, 255),
+      payload: input.payload.slice(0, 128),
+      provider_token: "",
+      currency: "XTR",
+      prices: [{ label: input.title, amount: input.stars }]
+    }),
+    { "content-type": "application/json" }
+  );
+}
+async function answerPreCheckoutQuery(preCheckoutQueryId, ok, errorMessage) {
+  return telegramRequest(
+    "answerPreCheckoutQuery",
+    JSON.stringify({ pre_checkout_query_id: preCheckoutQueryId, ok, error_message: errorMessage }),
+    { "content-type": "application/json" }
   );
 }
 
@@ -2693,6 +2870,19 @@ var OWNER_USERS_KEYBOARD = {
 var OWNER_SETTINGS_KEYBOARD = {
   keyboard: [
     [replyButton("\u23F1\uFE0F \u0645\u062F\u0629 \u0627\u0644\u062A\u0646\u0638\u064A\u0641", "primary")],
+    [replyButton("\u{1F4B3} \u0627\u0644\u062D\u062F\u0648\u062F \u0648\u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643", "primary")],
+    ...OWNER_FOOTER
+  ],
+  resize_keyboard: true,
+  is_persistent: true
+};
+var OWNER_LIMITS_KEYBOARD = {
+  keyboard: [
+    [replyButton("\u23F1\uFE0F \u0639\u062F\u062F \u0627\u0644\u062A\u0646\u0632\u064A\u0644\u0627\u062A", "primary"), replyButton("\u23F2\uFE0F \u0627\u0644\u0646\u0627\u0641\u0630\u0629 (\u0633\u0627\u0639\u0627\u062A)", "primary")],
+    [replyButton("\u2705 \u062A\u0634\u063A\u064A\u0644 \u062D\u062F \u0627\u0644\u0627\u0633\u062A\u062E\u062F\u0627\u0645", "success"), replyButton("\u{1F6AB} \u062D\u062F: \u0645\u062C\u0627\u0646\u064A", "danger")],
+    [replyButton("\u{1F4B3} \u0648\u0636\u0639 \u0627\u0644\u0628\u0648\u062A: \u0645\u062F\u0641\u0648\u0639", "success"), replyButton("\u{1F193} \u0648\u0636\u0639 \u0627\u0644\u0628\u0648\u062A: \u0645\u062C\u0627\u0646\u064A", "danger")],
+    [replyButton("\u2795 \u0625\u0636\u0627\u0641\u0629 \u062D\u0632\u0645\u0629", "success"), replyButton("\u26D4 \u0625\u064A\u0642\u0627\u0641 \u062D\u0632\u0645\u0629", "danger")],
+    [replyButton("\u{1F4CB} \u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u062D\u0632\u0645", "primary")],
     ...OWNER_FOOTER
   ],
   resize_keyboard: true,
@@ -2808,10 +2998,57 @@ function retryTikTokKeyboard(jobId) {
     inline_keyboard: [[inlineButton("\u{1F504} \u0625\u0639\u0627\u062F\u0629 \u0645\u062D\u0627\u0648\u0644\u0629 TikTok", `retry_tiktok:${jobId}`, "primary")]]
   };
 }
+function limitsPageText(settings) {
+  const limit = settings.usageLimitEnabled ? `\u0645\u0641\u0639\u0651\u0644: <b>${settings.usageLimitCount} \u062A\u0646\u0632\u064A\u0644 / ${settings.usageLimitWindowHours} \u0633\u0627\u0639\u0629</b>` : "\u0645\u0639\u0637\u0651\u0644 \u2014 <b>\u0645\u062C\u0627\u0646\u064A \u0628\u0644\u0627 \u0645\u0648\u0642\u062A</b>";
+  const mode = settings.paidModeEnabled ? "\u0645\u062F\u0641\u0648\u0639 \u{1F4B3}" : "\u0645\u062C\u0627\u0646\u064A \u{1F193}";
+  return `\u{1F4B3} <b>\u0627\u0644\u062D\u062F\u0648\u062F \u0648\u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643</b>
+
+\u23F1\uFE0F \u062D\u062F \u0627\u0644\u0627\u0633\u062A\u062E\u062F\u0627\u0645: ${limit}
+\u{1F4B3} \u0648\u0636\u0639 \u0627\u0644\u0628\u0648\u062A: <b>${mode}</b>
+
+\u0639\u0646\u062F \u0627\u0633\u062A\u0646\u0641\u0627\u062F \u0627\u0644\u062D\u0635\u0629 \u064A\u0638\u0647\u0631 \u0632\u0631 \xAB\u0627\u0634\u062A\u0631\u0643\xBB \u0644\u0644\u0645\u0633\u062A\u062E\u062F\u0645 \u062A\u0644\u0642\u0627\u0626\u064A\u0627\u064B \u0625\u0630\u0627 \u0643\u0627\u0646 \u0627\u0644\u0648\u0636\u0639 \u0645\u062F\u0641\u0648\u0639\u0627\u064B. \u062A\u062D\u062F\u062F \u0627\u0644\u062D\u0632\u0645 \u0627\u0644\u0645\u062F\u0629 \u0648\u0627\u0644\u0633\u0639\u0631 \u0628\u0627\u0644\u0646\u062C\u0648\u0645 \u2B50.`;
+}
+function planListText(plans) {
+  if (!plans.length) return "\u{1F4CB} \u0644\u0627 \u062A\u0648\u062C\u062F \u062D\u0632\u0645 \u0627\u0634\u062A\u0631\u0627\u0643 \u062D\u0627\u0644\u064A\u0627\u064B.\n\n\u0627\u0636\u063A\u0637 \xAB\u2795 \u0625\u0636\u0627\u0641\u0629 \u062D\u0632\u0645\u0629\xBB \u0644\u0625\u0646\u0634\u0627\u0621 \u0623\u0648\u0644 \u062D\u0632\u0645\u0629 \u0623\u0648 \xAB\u062A\u0648\u0642\u064A\u0641\u0647\u0627\xBB \u0628\u0627\u0633\u0645\u0647\u0627.";
+  const lines = plans.map(
+    (plan, index2) => `${index2 + 1}. ${plan.active ? "\u2705" : "\u26D4"} <b>${escapeHtml(plan.name)}</b>
+   \u0627\u0644\u0645\u062F\u0629: <b>${plan.durationDays} \u064A\u0648\u0645</b> \u2022 \u0627\u0644\u0633\u0639\u0631: <b>${plan.stars} \u2B50</b>${plan.active ? "" : " \u2014 \u0645\u0648\u0642\u0648\u0641\u0629"}`
+  ).join("\n\n");
+  return `\u{1F4B3} <b>\u062D\u0632\u0645 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643 (${plans.length})</b>
+
+${lines}
+
+\u0644\u0625\u0646\u0634\u0627\u0621 \u062D\u0632\u0645\u0629 \u0627\u0636\u063A\u0637 \xAB\u2795 \u0625\u0636\u0627\u0641\u0629 \u062D\u0632\u0645\u0629\xBB \u0648\u062A\u0627\u0628\u0639 \u0627\u0644\u0623\u0633\u0626\u0644\u0629.`;
+}
+function planCreatedText(plan) {
+  return `\u2705 \u0623\u064F\u0636\u064A\u0641\u062A \u0627\u0644\u062D\u0632\u0645\u0629 \u0628\u0646\u062C\u0627\u062D:
+<b>${escapeHtml(plan.name)}</b>
+\u0627\u0644\u0645\u062F\u0629: <b>${plan.durationDays} \u064A\u0648\u0645</b>
+\u0627\u0644\u0633\u0639\u0631: <b>${plan.stars} \u2B50</b>`;
+}
+function subscriptionEndsLabel(expiresAt) {
+  return new Date(expiresAt).toLocaleDateString("ar-EG", { day: "numeric", month: "long", year: "numeric" });
+}
+function usageLimitExceededText(count, windowHours, hasPlans) {
+  const subscribeHint = hasPlans ? "\n\n\u064A\u0645\u0643\u0646\u0643 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643 \u0627\u0644\u0622\u0646 \u0644\u0641\u062A\u062D \u062A\u0646\u0632\u064A\u0644\u0627\u062A <b>\u063A\u064A\u0631 \u0645\u062D\u062F\u0648\u062F\u0629</b> \u0641\u0648\u0631\u0627\u064B." : "";
+  return `\u26D4 \u0627\u0646\u062A\u0647\u062A \u062D\u0635\u062A\u0643 \u0645\u0646 \u0627\u0644\u062A\u0646\u0632\u064A\u0644
+
+<b>${count} \u0631\u0627\u0628\u0640\u0640\u0637 \u0644\u0643\u0644 ${windowHours} \u0633\u0627\u0639\u0629</b> \u0641\u0642\u0637 \u0645\u062C\u0627\u0646\u0627\u064B.
+\u0633\u064A\u0639\u0648\u062F \u0631\u0635\u064A\u062F\u0643 \u062A\u0644\u0642\u0627\u0626\u064A\u0627\u064B \u0628\u0639\u062F \u0645\u0631\u0648\u0631 \u0627\u0644\u0646\u0627\u0641\u0630\u0629.${subscribeHint}`;
+}
+function subscriptionOfferKeyboard(plans) {
+  return {
+    inline_keyboard: [
+      ...plans.filter((plan) => plan.active).map((plan) => [inlineButton(`\u{1F4B3} \u0627\u0634\u062A\u0631\u0643 \xB7 ${plan.name} \xB7 ${plan.durationDays} \u064A\u0648\u0645 \xB7 ${plan.stars} \u2B50`, `sub_plan:${plan.id}`, "success")]),
+      [inlineButton("\u2716\uFE0F \u0644\u0627\u062D\u0642\u0627\u064B", "sub_dismiss", "danger")]
+    ]
+  };
+}
 
 // server/telegram/botService.ts
 var recentRequests = /* @__PURE__ */ new Map();
 var pendingAdminInputs = /* @__PURE__ */ new Map();
+var planDrafts = /* @__PURE__ */ new Map();
 var pendingReports = /* @__PURE__ */ new Map();
 var ownerPageStacks = /* @__PURE__ */ new Map();
 var primaryOwnerEnsured = false;
@@ -2844,6 +3081,16 @@ var ownerControlLabels = /* @__PURE__ */ new Set([
   "\u{1F9F9} \u062A\u0646\u0638\u064A\u0641 \u0627\u0644\u0622\u0646",
   "\u{1F4E3} \u0625\u0631\u0633\u0627\u0644 \u0644\u0644\u062C\u0645\u064A\u0639",
   "\u{1F4CB} \u0623\u062E\u0637\u0627\u0621 \u062D\u062F\u064A\u062B\u0629",
+  "\u{1F4B3} \u0627\u0644\u062D\u062F\u0648\u062F \u0648\u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",
+  "\u23F1\uFE0F \u0639\u062F\u062F \u0627\u0644\u062A\u0646\u0632\u064A\u0644\u0627\u062A",
+  "\u23F2\uFE0F \u0627\u0644\u0646\u0627\u0641\u0630\u0629 (\u0633\u0627\u0639\u0627\u062A)",
+  "\u2705 \u062A\u0634\u063A\u064A\u0644 \u062D\u062F \u0627\u0644\u0627\u0633\u062A\u062E\u062F\u0627\u0645",
+  "\u{1F6AB} \u062D\u062F: \u0645\u062C\u0627\u0646\u064A",
+  "\u{1F4B3} \u0648\u0636\u0639 \u0627\u0644\u0628\u0648\u062A: \u0645\u062F\u0641\u0648\u0639",
+  "\u{1F193} \u0648\u0636\u0639 \u0627\u0644\u0628\u0648\u062A: \u0645\u062C\u0627\u0646\u064A",
+  "\u2795 \u0625\u0636\u0627\u0641\u0629 \u062D\u0632\u0645\u0629",
+  "\u26D4 \u0625\u064A\u0642\u0627\u0641 \u062D\u0632\u0645\u0629",
+  "\u{1F4CB} \u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u062D\u0632\u0645",
   "\u21A9\uFE0F \u0631\u062C\u0648\u0639",
   "\u{1F3E0} \u0627\u0644\u0631\u0626\u064A\u0633\u064A\u0629",
   "\u{1F6D1} \u0625\u0644\u063A\u0627\u0621 \u0627\u0644\u0639\u0645\u0644\u064A\u0629",
@@ -2919,6 +3166,7 @@ function ownerKeyboardFor(telegramId) {
   if (current === "settings") return OWNER_SETTINGS_KEYBOARD;
   if (current === "subscriptions") return OWNER_SUBSCRIPTIONS_KEYBOARD;
   if (current === "cleanup") return OWNER_CLEANUP_KEYBOARD;
+  if (current === "limits") return OWNER_LIMITS_KEYBOARD;
   return OWNER_KEYBOARD;
 }
 function normalizeOwnerLabel(text2) {
@@ -3050,6 +3298,9 @@ async function sendAdminPanel(chatId, telegramId) {
   ownerStack(telegramId).push("main");
   await sendMessage(chatId, "\u{1F451} <b>\u0644\u0648\u062D\u0629 \u0627\u0644\u0645\u0627\u0644\u0643 \u0627\u0644\u0623\u0633\u0627\u0633\u064A\u0629</b>\n\u0627\u062E\u062A\u0631 \u0648\u0638\u064A\u0641\u0629 \u0645\u0646 \u0627\u0644\u0623\u0632\u0631\u0627\u0631. \u0639\u0646\u062F \u0627\u0644\u062D\u0627\u062C\u0629 \u0644\u0631\u0642\u0645 \u0623\u0648 \u0646\u0635 \u0633\u0623\u0637\u0644\u0628\u0647 \u0645\u0646\u0643 \u0641\u064A \u0631\u0633\u0627\u0644\u0629 \u0645\u0646\u0641\u0635\u0644\u0629.", { replyMarkup: OWNER_KEYBOARD });
 }
+async function sendLimitsPage(chatId) {
+  await sendMessage(chatId, limitsPageText(await ensureBotSettings()), { replyMarkup: OWNER_LIMITS_KEYBOARD });
+}
 async function sendUserList(chatId, title, users2, replyMarkup) {
   if (!users2.length) return sendMessage(chatId, `\u0644\u0627 \u062A\u0648\u062C\u062F \u0646\u062A\u0627\u0626\u062C \u0641\u064A \u0642\u0627\u0626\u0645\u0629 \xAB${title}\xBB.`, { replyMarkup });
   const lines = users2.map((user, index2) => `${index2 + 1}. <b>${escapeHtml(user.displayName)}</b>${user.username ? ` (@${escapeHtml(user.username)})` : ""}
@@ -3065,7 +3316,13 @@ function pendingInputPrompt(action) {
     cleanup: "\u0623\u0631\u0633\u0644 \u0639\u062F\u062F \u0627\u0644\u0623\u064A\u0627\u0645 \u0642\u0628\u0644 \u062A\u0646\u0638\u064A\u0641 \u063A\u064A\u0631 \u0627\u0644\u0646\u0634\u0637\u064A\u0646\u060C \u0645\u0646 7 \u0625\u0644\u0649 365.",
     broadcast: "\u0623\u0631\u0633\u0644 \u0627\u0644\u0622\u0646 \u0646\u0635 \u0627\u0644\u0631\u0633\u0627\u0644\u0629. \u0633\u062A\u0635\u0644 \u0644\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646 \u0627\u0644\u0646\u0634\u0637\u064A\u0646 \u0641\u0642\u0637.",
     addChannel: "\u0623\u0631\u0633\u0644 \u0645\u0639\u0631\u0641 \u0627\u0644\u0642\u0646\u0627\u0629 \u0623\u0648 \u0627\u0644\u0645\u062C\u0645\u0648\u0639\u0629 \u0623\u0648 \u0627\u0644\u0628\u0648\u062A:\n- @username\n- \u0623\u0648 \u0631\u0642\u0645 \u0627\u0644\u0642\u0646\u0627\u0629\n- \u0623\u0648 \u0631\u0627\u0628\u0637 t.me/username",
-    removeChannel: "\u0623\u0631\u0633\u0644 \u0645\u0639\u0631\u0641 \u0627\u0644\u0642\u0646\u0627\u0629 \u0623\u0648 @username \u0623\u0648 \u0645\u0639\u0631\u0651\u0641\u0647\u0627 \u0645\u0646 \u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643."
+    removeChannel: "\u0623\u0631\u0633\u0644 \u0645\u0639\u0631\u0641 \u0627\u0644\u0642\u0646\u0627\u0629 \u0623\u0648 @username \u0623\u0648 \u0645\u0639\u0631\u0651\u0641\u0647\u0627 \u0645\u0646 \u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643.",
+    limitCount: "\u0623\u0631\u0633\u0644 \u0639\u062F\u062F \u0627\u0644\u062A\u0646\u0632\u064A\u0644\u0627\u062A \u0627\u0644\u0645\u0633\u0645\u0648\u062D \u0644\u0643\u0644 \u0645\u0633\u062A\u062E\u062F\u0645 \u062E\u0644\u0627\u0644 \u0627\u0644\u0646\u0627\u0641\u0630\u0629 (1 \u0625\u0644\u0649 1000).",
+    limitWindow: "\u0623\u0631\u0633\u0644 \u0645\u062F\u0629 \u0627\u0644\u0646\u0627\u0641\u0630\u0629 \u0628\u0627\u0644\u0633\u0627\u0639\u0627\u062A (1 \u0625\u0644\u0649 8760). \u0645\u062B\u0627\u0644: 12 \u0644\u0643\u0644 \u064A\u0648\u0645\u064A\u0646\u060C \u064824 \u0644\u064A\u0648\u0645 \u0643\u0627\u0645\u0644.",
+    planName: "\u0623\u0631\u0633\u0644 \u0627\u0633\u0645 \u0627\u0644\u062D\u0632\u0645\u0629 (\u0645\u062B\u0627\u0644: \u0623\u0633\u0628\u0648\u0639\u064A \u0623\u0648 \u0634\u0647\u0631\u064A).",
+    planDays: "\u0623\u0631\u0633\u0644 \u0645\u062F\u0629 \u0627\u0644\u062D\u0632\u0645\u0629 \u0628\u0627\u0644\u0623\u064A\u0627\u0645 (\u0645\u062B\u0627\u0644: 7 \u0644\u0623\u0633\u0628\u0648\u0639\u060C \u064830 \u0644\u0634\u0647\u0631).",
+    planStars: "\u0623\u0631\u0633\u0644 \u0627\u0644\u0633\u0639\u0631 \u0628\u0627\u0644\u0646\u062C\u0648\u0645 \u2B50 (\u0631\u0642\u0645\u0627\u064B \u0635\u062D\u064A\u062D\u0627\u064B).",
+    stopPlan: "\u0623\u0631\u0633\u0644 \u0627\u0633\u0645 \u0627\u0644\u062D\u0632\u0645\u0629 \u0627\u0644\u062A\u064A \u062A\u0631\u064A\u062F \u0625\u064A\u0642\u0627\u0641\u0647\u0627\u060C \u0645\u0646 \u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u062D\u0632\u0645."
   };
   return prompts[action];
 }
@@ -3105,6 +3362,34 @@ async function handleOwnerButton(message, text2) {
   if (text2 === "\u{1F9F9} \u062A\u0646\u0638\u064A\u0641 \u0627\u0644\u0628\u064A\u0627\u0646\u0627\u062A") {
     ownerStack(telegramId).push("cleanup");
     await sendMessage(chatId, "\u{1F9F9} <b>\u062A\u0646\u0638\u064A\u0641 \u0627\u0644\u0628\u064A\u0627\u0646\u0627\u062A</b>", { replyMarkup: OWNER_CLEANUP_KEYBOARD });
+    return true;
+  }
+  if (text2 === "\u{1F4B3} \u0627\u0644\u062D\u062F\u0648\u062F \u0648\u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643") {
+    ownerStack(telegramId).push("limits");
+    return sendLimitsPage(chatId);
+  }
+  if (text2 === "\u{1F4CB} \u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u062D\u0632\u0645") {
+    await sendMessage(chatId, planListText(await listSubscriptionPlans()), { replyMarkup: OWNER_LIMITS_KEYBOARD });
+    return true;
+  }
+  if (text2 === "\u2705 \u062A\u0634\u063A\u064A\u0644 \u062D\u062F \u0627\u0644\u0627\u0633\u062A\u062E\u062F\u0627\u0645") {
+    await updateUsageLimit({ enabled: true });
+    await sendMessage(chatId, "\u2705 \u062A\u0645 \u062A\u0634\u063A\u064A\u0644 \u062D\u062F \u0627\u0644\u0627\u0633\u062A\u062E\u062F\u0627\u0645.", { replyMarkup: OWNER_LIMITS_KEYBOARD });
+    return true;
+  }
+  if (text2 === "\u{1F6AB} \u062D\u062F: \u0645\u062C\u0627\u0646\u064A") {
+    await updateUsageLimit({ enabled: false });
+    await sendMessage(chatId, "\u{1F6AB} \u062A\u0645 \u0625\u0644\u063A\u0627\u0621 \u0627\u0644\u062D\u062F. \u0627\u0644\u0628\u0648\u062A \u0627\u0644\u0622\u0646 \u0645\u062C\u0627\u0646\u064A \u0628\u0644\u0627 \u0645\u0648\u0642\u062A.", { replyMarkup: OWNER_LIMITS_KEYBOARD });
+    return true;
+  }
+  if (text2 === "\u{1F4B3} \u0648\u0636\u0639 \u0627\u0644\u0628\u0648\u062A: \u0645\u062F\u0641\u0648\u0639") {
+    await updatePaidMode(true);
+    await sendMessage(chatId, "\u{1F4B3} \u062A\u0645 \u062A\u0641\u0639\u064A\u0644 \u0627\u0644\u0648\u0636\u0639 \u0627\u0644\u0645\u062F\u0641\u0648\u0639. \u0633\u062A\u0638\u0647\u0631 \u062D\u0632\u0645 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643 \u0644\u0645\u0646 \u0627\u0633\u062A\u0646\u0641\u062F \u062D\u0635\u062A\u0647.", { replyMarkup: OWNER_LIMITS_KEYBOARD });
+    return true;
+  }
+  if (text2 === "\u{1F193} \u0648\u0636\u0639 \u0627\u0644\u0628\u0648\u062A: \u0645\u062C\u0627\u0646\u064A") {
+    await updatePaidMode(false);
+    await sendMessage(chatId, "\u{1F193} \u0623\u064F\u0637\u0641\u0626 \u0627\u0644\u0648\u0636\u0639 \u0627\u0644\u0645\u062F\u0641\u0648\u0639. \u0644\u0646 \u062A\u0638\u0647\u0631 \u0623\u0632\u0631\u0627\u0631 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643.", { replyMarkup: OWNER_LIMITS_KEYBOARD });
     return true;
   }
   if (text2 === "\u{1F4CA} \u0627\u0644\u0625\u062D\u0635\u0627\u0621\u0627\u062A") {
@@ -3180,7 +3465,11 @@ ${lines}${note}
     "\u23F1\uFE0F \u0645\u062F\u0629 \u0627\u0644\u062A\u0646\u0638\u064A\u0641": { action: "cleanup" },
     "\u{1F4E3} \u0625\u0631\u0633\u0627\u0644 \u0644\u0644\u062C\u0645\u064A\u0639": { action: "broadcast" },
     "\u2795 \u0625\u0636\u0627\u0641\u0629 \u0642\u0646\u0627\u0629/\u0628\u0648\u062A": { action: "addChannel" },
-    "\u2796 \u0625\u0632\u0627\u0644\u0629 \u0642\u0646\u0627\u0629/\u0628\u0648\u062A": { action: "removeChannel" }
+    "\u2796 \u0625\u0632\u0627\u0644\u0629 \u0642\u0646\u0627\u0629/\u0628\u0648\u062A": { action: "removeChannel" },
+    "\u23F1\uFE0F \u0639\u062F\u062F \u0627\u0644\u062A\u0646\u0632\u064A\u0644\u0627\u062A": { action: "limitCount" },
+    "\u23F2\uFE0F \u0627\u0644\u0646\u0627\u0641\u0630\u0629 (\u0633\u0627\u0639\u0627\u062A)": { action: "limitWindow" },
+    "\u2795 \u0625\u0636\u0627\u0641\u0629 \u062D\u0632\u0645\u0629": { action: "planName" },
+    "\u26D4 \u0625\u064A\u0642\u0627\u0641 \u062D\u0632\u0645\u0629": { action: "stopPlan" }
   };
   if (inputs[text2]) {
     beginAdminInput(telegramId, inputs[text2].action);
@@ -3206,6 +3495,41 @@ async function handlePendingAdminInput(message, text2) {
   }
   const chatId = String(message.chat.id);
   const replyMarkup = ownerKeyboardFor(telegramId);
+  if (pending2.action === "planName" || pending2.action === "planDays" || pending2.action === "planStars") {
+    pendingAdminInputs.delete(telegramId);
+    try {
+      if (pending2.action === "planName") {
+        const name = text2.trim().slice(0, 60);
+        if (!name) throw new Error("\u0627\u0643\u062A\u0628 \u0627\u0633\u0645\u0627\u064B \u0635\u062D\u064A\u062D\u0627\u064B \u0644\u0644\u062D\u0632\u0645\u0629.");
+        planDrafts.set(telegramId, { name, days: 0 });
+        beginAdminInput(telegramId, "planDays");
+        await sendMessage(chatId, "\u270D\uFE0F \u0623\u0631\u0633\u0644 \u0645\u062F\u0629 \u0627\u0644\u062D\u0632\u0645\u0629 \u0628\u0627\u0644\u0623\u064A\u0627\u0645 (\u0645\u062B\u0627\u0644: 7 \u0644\u0623\u0633\u0628\u0648\u0639\u060C 30 \u0644\u0634\u0647\u0631).");
+      } else if (pending2.action === "planDays") {
+        const draft = planDrafts.get(telegramId);
+        const days = Number(text2.trim());
+        if (!draft) throw new Error("\u0627\u0628\u062F\u0623 \u0645\u0646 \u062C\u062F\u064A\u062F \u0628\u0637\u0644\u0628 \xAB\u0625\u0636\u0627\u0641\u0629 \u062D\u0632\u0645\u0629\xBB.");
+        if (!Number.isInteger(days) || days < 1 || days > 3650) throw new Error("\u0623\u0631\u0633\u0644 \u0639\u062F\u062F\u0627\u064B \u0635\u062D\u064A\u062D\u0627\u064B \u0645\u0646 \u0627\u0644\u0623\u064A\u0627\u0645 \u0628\u064A\u0646 1 \u06483650.");
+        planDrafts.set(telegramId, { ...draft, days });
+        beginAdminInput(telegramId, "planStars");
+        await sendMessage(chatId, "\u270D\uFE0F \u0623\u0631\u0633\u0644 \u0627\u0644\u0633\u0639\u0631 \u0628\u0627\u0644\u0646\u062C\u0648\u0645 \u2B50 (\u0631\u0642\u0645\u0627\u064B \u0635\u062D\u064A\u062D\u0627\u064B).");
+      } else {
+        const draft = planDrafts.get(telegramId);
+        const stars = Number(text2.trim());
+        if (!draft?.name || !draft.days) throw new Error("\u0627\u0628\u062F\u0623 \u0645\u0646 \u062C\u062F\u064A\u062F \u0628\u0637\u0644\u0628 \xAB\u0625\u0636\u0627\u0641\u0629 \u062D\u0632\u0645\u0629\xBB.");
+        if (!Number.isInteger(stars) || stars < 1 || stars > 1e5) throw new Error("\u0623\u0631\u0633\u0644 \u0639\u062F\u062F \u0646\u062C\u0648\u0645 \u0635\u062D\u064A\u062D\u0627\u064B \u0628\u064A\u0646 1 \u0648100000.");
+        const plan = await addSubscriptionPlan({ name: draft.name, durationDays: draft.days, stars });
+        planDrafts.delete(telegramId);
+        await sendMessage(chatId, planCreatedText(plan), { replyMarkup: OWNER_LIMITS_KEYBOARD });
+        await notifyOwners(`\u{1F4B3} <b>\u0625\u0636\u0627\u0641\u0629 \u062D\u0632\u0645\u0629 \u0627\u0634\u062A\u0631\u0627\u0643</b>
+\u0627\u0644\u0627\u0633\u0645: <b>${escapeHtml(plan.name)}</b>
+\u0627\u0644\u0645\u062F\u0629: <b>${plan.durationDays} \u064A\u0648\u0645</b>
+\u0627\u0644\u0633\u0639\u0631: <b>${plan.stars} \u2B50</b>`);
+      }
+    } catch (error) {
+      await sendMessage(chatId, `\u062A\u0639\u0630\u0631 \u0627\u0644\u062A\u0646\u0641\u064A\u0630: <b>${escapeHtml(error instanceof Error ? error.message : "\u062E\u0637\u0623 \u063A\u064A\u0631 \u0645\u062A\u0648\u0642\u0639")}</b>`, { replyMarkup: ownerKeyboardFor(telegramId) });
+    }
+    return true;
+  }
   const { activeRecipients: activeRecipients2, setTelegramUserBlocked: setTelegramUserBlocked2, updateCleanupInactiveDays: updateCleanupInactiveDays2 } = await Promise.resolve().then(() => (init_botDb(), botDb_exports));
   try {
     if (pending2.action === "ban" || pending2.action === "unban") {
@@ -3235,6 +3559,22 @@ async function handlePendingAdminInput(message, text2) {
       await notifyOwners(`\u{1F513} <b>\u0625\u0632\u0627\u0644\u0629 \u0627\u0634\u062A\u0631\u0627\u0643 \u0625\u062C\u0628\u0627\u0631\u064A</b>
 \u0627\u0644\u0645\u0639\u0631\u0651\u0641: <code>${escapeHtml(text2.trim())}</code>`);
       await sendMessage(chatId, "\u2705 \u062A\u0645\u062A \u0625\u0632\u0627\u0644\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643 \u0628\u0646\u062C\u0627\u062D.", { replyMarkup });
+    } else if (pending2.action === "limitCount") {
+      const value = Number(text2.trim());
+      if (!Number.isInteger(value) || value < 1 || value > 1e3) throw new Error("\u0623\u062F\u062E\u0644 \u0639\u062F\u062F \u062A\u0646\u0632\u064A\u0644\u0627\u062A \u0628\u064A\u0646 1 \u06481000.");
+      await updateUsageLimit({ count: value, enabled: true });
+      await sendMessage(chatId, `\u062A\u0645 \u0636\u0628\u0637 \u062D\u062F \u0627\u0644\u062A\u0646\u0632\u064A\u0644: <b>${value}</b> \u062A\u0646\u0632\u064A\u0644 \u0644\u0643\u0644 \u0646\u0627\u0641\u0630\u0629. \u0627\u0644\u0628\u0648\u062A \u0627\u0644\u0622\u0646 \u0645\u062D\u062F\u0648\u062F.`, { replyMarkup });
+    } else if (pending2.action === "limitWindow") {
+      const value = Number(text2.trim());
+      if (!Number.isInteger(value) || value < 1 || value > 8760) throw new Error("\u0623\u062F\u062E\u0644 \u0639\u062F\u062F \u0633\u0627\u0639\u0627\u062A \u0628\u064A\u0646 1 \u06488760.");
+      await updateUsageLimit({ windowHours: value });
+      await sendMessage(chatId, `\u062A\u0645 \u0636\u0628\u0637 \u0646\u0627\u0641\u0630\u0629 \u0627\u0644\u062D\u062F: <b>${value}</b> \u0633\u0627\u0639\u0629.`, { replyMarkup });
+    } else if (pending2.action === "stopPlan") {
+      const stopped2 = await setSubscriptionPlanActive(text2, false);
+      if (!stopped2) throw new Error("\u0644\u0645 \u064A\u062A\u0645 \u0627\u0644\u0639\u062B\u0648\u0631 \u0639\u0644\u0649 \u062D\u0632\u0645\u0629 \u0628\u0647\u0630\u0627 \u0627\u0644\u0627\u0633\u0645. \u062A\u062D\u0642\u0642 \u0645\u0646 \u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u062D\u0632\u0645.");
+      await notifyOwners(`\u26D4 <b>\u0625\u064A\u0642\u0627\u0641 \u062D\u0632\u0645\u0629</b>
+\u0627\u0644\u062D\u0632\u0645\u0629: <b>${escapeHtml(text2.trim())}</b>`);
+      await sendMessage(chatId, `\u26D4 \u0623\u064F\u0648\u0642\u0641\u062A \u0627\u0644\u062D\u0632\u0645\u0629 \xAB<b>${escapeHtml(text2.trim())}</b>\xBB. \u0644\u0646 \u062A\u0638\u0647\u0631 \u0644\u0639\u0645\u0644\u0627\u0621 \u062C\u062F\u062F.`, { replyMarkup });
     } else {
       const content = text2.trim();
       if (!content || content.length > 3500) throw new Error("\u0627\u0643\u062A\u0628 \u0631\u0633\u0627\u0644\u0629 \u0628\u064A\u0646 1 \u06483500 \u062D\u0631\u0641\u0627\u064B.");
@@ -3260,6 +3600,7 @@ async function handlePendingAdminInput(message, text2) {
 }
 async function handleMessage(message) {
   const admission = await admitMessage(message);
+  if (message.successful_payment) return handleSuccessfulPayment(message);
   if (!admission.admitted || !message.text) return;
   const text2 = message.text.trim();
   const chatId = String(message.chat.id);
@@ -3319,6 +3660,41 @@ async function handleMessage(message) {
   if (!/^https:\/\//i.test(text2)) return sendMessage(chatId, "\u0623\u0631\u0633\u0644 \u0631\u0627\u0628\u0637\u0627\u064B \u0639\u0627\u0645\u0627\u064B \u064A\u0628\u062F\u0623 \u0628\u0640 https:// \u0623\u0648 \u0627\u0636\u063A\u0637 \xAB\u0637\u0631\u064A\u0642\u0629 \u0627\u0644\u0627\u0633\u062A\u062E\u062F\u0627\u0645\xBB.", { replyMarkup: keyboardFor(admission.primary) });
   await inspectIncomingLink(message, text2, admission.primary);
 }
+async function handleSuccessfulPayment(message) {
+  const payment = message.successful_payment;
+  const telegramId = String(message.from.id);
+  const chatId = String(message.chat.id);
+  const primary = await isPrimaryOwner(telegramId);
+  const planId = payment.invoice_payload.replace(/^sub:/, "");
+  const plan = await findSubscriptionPlanById(planId);
+  if (!plan) {
+    return sendMessage(chatId, "\u062A\u0645 \u0627\u0633\u062A\u0644\u0627\u0645 \u0645\u062F\u0641\u0648\u0639\u0627\u062A\u0643\u060C \u0644\u0643\u0646 \u062A\u0639\u0630\u0631 \u0627\u0644\u062A\u0639\u0631\u0641 \u0639\u0644\u0649 \u0627\u0644\u062D\u0632\u0645\u0629. \u062A\u0648\u0627\u0635\u0644 \u0645\u0639 \u0627\u0644\u0645\u0627\u0644\u0643.", { replyMarkup: keyboardFor(primary) });
+  }
+  const access = await getUserAccess(telegramId);
+  const base = Math.max(Date.now(), access.subscriptionExpiresAt || 0);
+  const expiresAt = base + plan.durationDays * 864e5;
+  await setUserSubscription(telegramId, expiresAt, plan.id);
+  await notifyOwners(`\u{1F4B0} <b>\u0627\u0634\u062A\u0631\u0627\u0643 \u062C\u062F\u064A\u062F \u0628\u0627\u0644\u0646\u062C\u0648\u0645</b>
+\u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645: <code>${escapeHtml(telegramId)}</code>
+\u0627\u0644\u062D\u0632\u0645\u0629: <b>${escapeHtml(plan.name)}</b>
+\u0627\u0644\u0645\u062F\u0629: <b>${plan.durationDays} \u064A\u0648\u0645</b>
+\u0627\u0644\u0633\u0639\u0631: <b>${plan.stars} \u2B50</b>
+\u064A\u0646\u062A\u0647\u064A: <b>${subscriptionEndsLabel(expiresAt)}</b>
+\u0627\u0644\u062A\u0632\u0627\u0645: <code>${escapeHtml(payment.telegram_payment_charge_id)}</code>`);
+  return sendMessage(chatId, `\u2705 <b>\u062A\u0645 \u062A\u0641\u0639\u064A\u0644 \u0627\u0634\u062A\u0631\u0627\u0643\u0643 \u0628\u0646\u062C\u0627\u062D!</b>
+
+\u0627\u0644\u062D\u0632\u0645\u0629: <b>${escapeHtml(plan.name)}</b>
+\u0627\u0644\u0645\u062F\u0629: <b>${plan.durationDays} \u064A\u0648\u0645</b>
+\u064A\u0646\u062A\u0647\u064A: <b>${subscriptionEndsLabel(expiresAt)}</b>
+
+\u062A\u0646\u0632\u064A\u0644\u0627\u062A\u0643 \u0645\u0641\u062A\u0648\u062D\u0629 \u0627\u0644\u0622\u0646 \u0628\u0644\u0627 \u062D\u062F\u0648\u062F. \u0634\u0643\u0631\u0627\u064B \u0644\u062F\u0639\u0645\u0643 \u{1F389}`, { replyMarkup: keyboardFor(primary) });
+}
+async function handlePreCheckoutQuery(query) {
+  const planId = query.invoice_payload.replace(/^sub:/, "");
+  const plan = await findSubscriptionPlanById(planId);
+  if (!plan || !plan.active) return answerPreCheckoutQuery(query.id, false, "\u0627\u0644\u062D\u0632\u0645\u0629 \u063A\u064A\u0631 \u0645\u062A\u0627\u062D\u0629 \u062D\u0627\u0644\u064A\u0627\u064B.");
+  return answerPreCheckoutQuery(query.id, true);
+}
 async function handleDownloadCallback(callback) {
   const chatId = callback.message ? String(callback.message.chat.id) : String(callback.from.id);
   const data = callback.data || "";
@@ -3359,6 +3735,26 @@ async function handleDownloadCallback(callback) {
     }, retryJob.sourceUrl, primary);
     return;
   }
+  if (data === "sub_dismiss") return answerCallbackQuery(callback.id, "\u062D\u0633\u0646\u0627\u064B. \u0633\u062A\u0638\u0644 \u0627\u0644\u062D\u0635\u0629 \u0627\u0644\u062D\u0627\u0644\u064A\u0629 \u0645\u062A\u0627\u062D\u0629.");
+  if (data.startsWith("sub_plan:")) {
+    if (!allowCallback(senderId)) return answerCallbackQuery(callback.id, "\u{1F4A1} \u0623\u0646\u062A \u062A\u0636\u063A\u0637 \u0628\u0633\u0631\u0639\u0629. \u0627\u0646\u062A\u0638\u0631 \u0642\u0644\u064A\u0644\u0627\u064B \u062B\u0645 \u0623\u0639\u062F \u0627\u0644\u0645\u062D\u0627\u0648\u0644\u0629.");
+    const planId = data.slice("sub_plan:".length);
+    const plan = await findSubscriptionPlanById(planId);
+    if (!plan || !plan.active) return answerCallbackQuery(callback.id, "\u0627\u0644\u062D\u0632\u0645\u0629 \u063A\u064A\u0631 \u0645\u062A\u0627\u062D\u0629 \u062D\u0627\u0644\u064A\u0627\u064B");
+    await answerCallbackQuery(callback.id, "\u062C\u0627\u0631\u064D \u062A\u062C\u0647\u064A\u0632 \u0641\u0627\u062A\u0648\u0631\u0629 \u0627\u0644\u062F\u0641\u0639 \u2B50\u2026");
+    try {
+      await sendInvoice(chatId, {
+        title: `\u0627\u0634\u062A\u0631\u0627\u0643 ${plan.name}`,
+        description: `\u062A\u0641\u0639\u064A\u0644 \u062A\u0646\u0632\u064A\u0644\u0627\u062A \u0628\u0644\u0627 \u062D\u062F\u0648\u062F \u0644\u0645\u062F\u0629 ${plan.durationDays} \u064A\u0648\u0645\u0627\u064B \u0645\u0642\u0627\u0628\u0644 ${plan.stars} \u0646\u062C\u0645\u0629.`,
+        payload: `sub:${plan.id}`,
+        stars: plan.stars
+      });
+    } catch (error) {
+      console.error("[Telegram Stars] sendInvoice failed", error);
+      await sendMessage(chatId, "\u062A\u0639\u0630\u0631 \u0625\u0646\u0634\u0627\u0621 \u0641\u0627\u062A\u0648\u0631\u0629 \u0627\u0644\u062F\u0641\u0639 \u062D\u0627\u0644\u064A\u0627\u064B. \u062A\u0623\u0643\u062F \u0645\u0646 \u062A\u0648\u0641\u0631 \u0646\u062C\u0648\u0645 \u062A\u0648\u0627\u0635\u0644 \u0623\u0648 \u062D\u0627\u0648\u0644 \u0644\u0627\u062D\u0642\u0627\u064B.", { replyMarkup: keyboardFor(primary) });
+    }
+    return;
+  }
   const parts = data.split(":");
   const jobId = parts[1];
   const rawChoice = parts[2];
@@ -3368,6 +3764,23 @@ async function handleDownloadCallback(callback) {
   if (!allowCallback(senderId)) return answerCallbackQuery(callback.id, "\u{1F4A1} \u0623\u0646\u062A \u062A\u0636\u063A\u0637 \u0628\u0633\u0631\u0639\u0629. \u0627\u0646\u062A\u0638\u0631 \u0642\u0644\u064A\u0644\u0627\u064B \u062B\u0645 \u0623\u0639\u062F \u0627\u0644\u0645\u062D\u0627\u0648\u0644\u0629.");
   const job = await getMediaJob(jobId);
   if (!job || job.telegramId !== senderId || job.status !== "ready" || job.cancelRequested) return answerCallbackQuery(callback.id, "\u0627\u0646\u062A\u0647\u062A \u0635\u0644\u0627\u062D\u064A\u0629 \u0647\u0630\u0627 \u0627\u0644\u0637\u0644\u0628");
+  const settings = await ensureBotSettings();
+  if (!primary && settings.usageLimitEnabled) {
+    const access = await getUserAccess(senderId);
+    const subscribed = Boolean(access.subscriptionExpiresAt && access.subscriptionExpiresAt > Date.now());
+    if (!subscribed) {
+      const used = await userDownloadsInWindow(senderId, settings.usageLimitWindowHours);
+      if (used >= settings.usageLimitCount) {
+        const plans = await listSubscriptionPlans();
+        const hasActivePlans = plans.some((plan) => plan.active);
+        await answerCallbackQuery(callback.id, hasActivePlans ? "\u0627\u0646\u062A\u0647\u062A \u062D\u0635\u062A\u0643 \u0627\u0644\u0645\u062C\u0627\u0646\u064A\u0629" : "\u0627\u0646\u062A\u0647\u062A \u062D\u0635\u062A\u0643 \u0627\u0644\u064A\u0648\u0645\u064A\u0629");
+        if (hasActivePlans && settings.paidModeEnabled) {
+          return sendMessage(chatId, usageLimitExceededText(settings.usageLimitCount, settings.usageLimitWindowHours, true), { replyMarkup: subscriptionOfferKeyboard(plans) });
+        }
+        return sendMessage(chatId, usageLimitExceededText(settings.usageLimitCount, settings.usageLimitWindowHours, false), { replyMarkup: keyboardFor(primary) });
+      }
+    }
+  }
   await answerCallbackQuery(callback.id, allImages ? "\u0628\u062F\u0623 \u062A\u062C\u0647\u064A\u0632 \u0627\u0644\u0635\u0648\u0631" : "\u0628\u062F\u0623 \u062A\u062C\u0647\u064A\u0632 \u0627\u0644\u0645\u0644\u0641");
   await updateMediaJob(jobId, { status: "downloading", selectedChoice: choice });
   const action = allImages || choice === "image" ? "upload_photo" : choice === "audio" ? "upload_audio" : "upload_video";
@@ -3404,6 +3817,7 @@ async function handleDownloadCallback(callback) {
 \u0627\u0644\u0646\u0648\u0639: <b>${allImages ? "\u0635\u0648\u0631 \u0643\u0627\u0645\u0644\u0629" : mediaLabel(choice)}</b>
 \u0627\u0644\u062D\u062C\u0645: <b>${Math.round(output.bytes / 1024)} KB</b>
 \u0627\u0644\u0631\u0627\u0628\u0637: <code>${escapeHtml(job.sourceUrl.slice(0, 500))}</code>`);
+    if (!primary) await recordUserDownload(senderId, settings.usageLimitWindowHours);
   } catch (error) {
     if (error instanceof DownloaderError && error.message === "\u062A\u0645 \u0625\u0644\u063A\u0627\u0621 \u0627\u0644\u0639\u0645\u0644\u064A\u0629 \u0628\u0646\u062C\u0627\u062D.") return;
     if (error instanceof DownloadQueueError) {
@@ -3435,10 +3849,11 @@ async function processTelegramUpdate(update) {
   if (!isValidTelegramUpdateId(update.update_id)) return;
   if (!await claimTelegramUpdate(update.update_id)) return;
   try {
+    if (update.pre_checkout_query) return handlePreCheckoutQuery(update.pre_checkout_query);
     if (update.message) return handleMessage(update.message);
     if (update.callback_query) return handleDownloadCallback(update.callback_query);
   } catch (error) {
-    const telegramId = update.message?.from ? String(update.message.from.id) : update.callback_query ? String(update.callback_query.from.id) : void 0;
+    const telegramId = update.message?.from ? String(update.message.from.id) : update.callback_query ? String(update.callback_query.from.id) : update.pre_checkout_query ? String(update.pre_checkout_query.from.id) : void 0;
     await notifyError({ telegramId, stage: "\u0645\u0639\u0627\u0644\u062C\u0629 \u062A\u062D\u062F\u064A\u062B Telegram", error });
     throw error;
   }

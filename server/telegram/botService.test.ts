@@ -20,6 +20,13 @@ const stubs = vi.hoisted(() => ({
   deleteMediaJob: vi.fn(),
   updateMediaJob: vi.fn(),
   answerCallbackQuery: vi.fn(),
+  ensureBotSettings: vi.fn(),
+  getUserAccess: vi.fn(),
+  userDownloadsInWindow: vi.fn(),
+  recordUserDownload: vi.fn(),
+  listSubscriptionPlans: vi.fn(),
+  findSubscriptionPlanById: vi.fn(),
+  setUserSubscription: vi.fn(),
 }));
 
 vi.mock("./botDb", () => ({
@@ -32,21 +39,32 @@ vi.mock("./botDb", () => ({
   cleanupBotData: vi.fn(),
   createMediaJob: stubs.createMediaJob,
   deleteMediaJob: stubs.deleteMediaJob,
+  ensureBotSettings: stubs.ensureBotSettings,
   ensurePrimaryOwner: vi.fn(),
   getMediaJob: stubs.getMediaJob,
   getOwnerRole: stubs.getOwnerRole,
   getTelegramUser: vi.fn(async () => undefined),
+  getUserAccess: stubs.getUserAccess,
   isPrimaryOwner: stubs.isPrimaryOwner,
   listForcedSubscriptions: stubs.listForcedSubscriptions,
   listOwners: vi.fn(async () => []),
+  listSubscriptionPlans: stubs.listSubscriptionPlans,
   listTelegramUsers: vi.fn(),
   recentErrors: vi.fn(),
   recordBotError: stubs.recordBotError,
+  recordUserDownload: stubs.recordUserDownload,
   removeForcedSubscription: stubs.removeForcedSubscription,
   setTelegramUserBlocked: stubs.setTelegramUserBlocked,
+  setUserSubscription: stubs.setUserSubscription,
   touchAndAdmitUser: stubs.touchAndAdmitUser,
   updateCleanupInactiveDays: vi.fn(),
   updateMediaJob: stubs.updateMediaJob,
+  userDownloadsInWindow: stubs.userDownloadsInWindow,
+  findSubscriptionPlanById: stubs.findSubscriptionPlanById,
+  setSubscriptionPlanActive: vi.fn(),
+  updatePaidMode: vi.fn(),
+  updateUsageLimit: vi.fn(),
+  addSubscriptionPlan: vi.fn(),
 }));
 
 vi.mock("./downloader", () => ({
@@ -60,16 +78,18 @@ vi.mock("./downloader", () => ({
 
 vi.mock("./telegramApi", () => ({
   answerCallbackQuery: stubs.answerCallbackQuery,
+  answerPreCheckoutQuery: vi.fn(async () => true),
   getChatMember: stubs.getChatMember,
   sendChatAction: vi.fn(async () => true),
   sendDownloadedMedia: vi.fn(),
+  sendInvoice: vi.fn(),
   sendMediaGroup: vi.fn(),
   sendMessage: stubs.sendMessage,
   sendWelcomePhoto: stubs.sendWelcomePhoto,
 }));
 
 import { buildReportNotification, processTelegramUpdate } from "./botService";
-import { OWNER_KEYBOARD, subscriptionGateKeyboard, USER_KEYBOARD } from "./messages";
+import { OWNER_KEYBOARD, OWNER_LIMITS_KEYBOARD, subscriptionGateKeyboard, subscriptionOfferKeyboard, usageLimitExceededText, USER_KEYBOARD } from "./messages";
 
 function subscription(target: string, inviteUrl: string, kind = "channel") {
   return { id: `sub-${target}`, target, inviteUrl, label: `@${target}`, kind, createdAt: new Date() };
@@ -109,10 +129,25 @@ describe("معالجة تحديثات Telegram", () => {
     stubs.deleteMediaJob.mockReset();
     stubs.updateMediaJob.mockReset();
     stubs.answerCallbackQuery.mockReset();
+    stubs.ensureBotSettings.mockReset();
+    stubs.getUserAccess.mockReset();
+    stubs.userDownloadsInWindow.mockReset();
+    stubs.recordUserDownload.mockReset();
+    stubs.listSubscriptionPlans.mockReset();
+    stubs.findSubscriptionPlanById.mockReset();
+    stubs.setUserSubscription.mockReset();
     stubs.listForcedSubscriptions.mockResolvedValue([]);
     stubs.getOwnerRole.mockResolvedValue(undefined);
     stubs.getChatMember.mockResolvedValue({ status: "member" });
     stubs.sendWelcomePhoto.mockResolvedValue(true);
+    stubs.ensureBotSettings.mockResolvedValue({
+      id: "settings", maxUsers: 100, cleanupInactiveDays: 30, cleanupTempMinutes: 60,
+      broadcastRatePerSecond: 20, notifyNewUsers: true, usageLimitEnabled: false,
+      usageLimitCount: 5, usageLimitWindowHours: 24, paidModeEnabled: false,
+      updatedAt: new Date().toISOString(),
+    });
+    stubs.getUserAccess.mockResolvedValue({ subscriptionExpiresAt: null, subscriptionPlanId: null, downloadTimestamps: [] });
+    stubs.userDownloadsInWindow.mockResolvedValue(0);
   });
 
   afterEach(() => {
@@ -389,5 +424,70 @@ describe("معالجة تحديثات Telegram", () => {
     } as never, "تفاصيل مختصرة");
     expect(notification.text).toContain("905");
     expect(notification.replyMarkup.inline_keyboard[0][0].url).toBe("tg://user?id=905");
+  });
+
+  it("يعرض صفحة الحدود للمالك ويضبط عدد التنزيلات من الإدخال", async () => {
+    stubs.claimTelegramUpdate.mockResolvedValue(true);
+    stubs.touchAndAdmitUser.mockResolvedValue({ admission: "active", isNew: false });
+    stubs.isPrimaryOwner.mockResolvedValue(true);
+    stubs.getOwnerRole.mockResolvedValue("primary");
+    await processTelegramUpdate(ownerMessage(70, "💳 الحدود والاشتراك"));
+    expect(stubs.sendMessage).toHaveBeenCalledWith("902", expect.stringContaining("حد الاستخدام"), { replyMarkup: OWNER_LIMITS_KEYBOARD });
+    await processTelegramUpdate(ownerMessage(71, "⏱️ عدد التنزيلات"));
+    await processTelegramUpdate(ownerMessage(72, "5"));
+    expect((await import("./botDb")).updateUsageLimit).toHaveBeenCalledWith({ count: 5, enabled: true });
+    expect(stubs.sendMessage).toHaveBeenCalledWith("902", expect.stringContaining("تم ضبط حد التنزيل"), { replyMarkup: OWNER_LIMITS_KEYBOARD });
+  });
+
+  it("يعرض حزم الاشتراك للمستخدم الذي استنفد حصته في الوضع المدفوع", async () => {
+    stubs.claimTelegramUpdate.mockResolvedValue(true);
+    stubs.isPrimaryOwner.mockResolvedValue(false);
+    stubs.getMediaJob.mockResolvedValue({
+      id: "quota-job", telegramId: "901", sourceUrl: "https://www.tiktok.com/@a/video/1", platform: "tiktok", status: "ready", cancelRequested: false,
+    });
+    stubs.ensureBotSettings.mockResolvedValue({
+      id: "settings", maxUsers: 100, cleanupInactiveDays: 30, cleanupTempMinutes: 60,
+      broadcastRatePerSecond: 20, notifyNewUsers: true, usageLimitEnabled: true,
+      usageLimitCount: 5, usageLimitWindowHours: 24, paidModeEnabled: true,
+      updatedAt: new Date().toISOString(),
+    });
+    stubs.getUserAccess.mockResolvedValue({ subscriptionExpiresAt: null, subscriptionPlanId: null, downloadTimestamps: [] });
+    stubs.userDownloadsInWindow.mockResolvedValue(5);
+    const plans = [{ id: "p1", name: "شهري", durationDays: 30, stars: 100, active: true, createdAt: new Date() }];
+    stubs.listSubscriptionPlans.mockResolvedValue(plans);
+    await processTelegramUpdate({
+      update_id: 73,
+      callback_query: { id: "quota-cb", data: "dl:quota-job:video", from: { id: 901, first_name: "مستخدم" }, message: { message_id: 30, chat: { id: 901, type: "private" } } },
+    } as never);
+    expect(stubs.answerCallbackQuery).toHaveBeenCalledWith("quota-cb", "انتهت حصتك المجانية");
+    expect(stubs.sendMessage).toHaveBeenCalledWith("901", usageLimitExceededText(5, 24, true), { replyMarkup: subscriptionOfferKeyboard(plans) });
+    expect(stubs.deleteMediaJob).not.toHaveBeenCalledWith("quota-job");
+  });
+
+  it("يفعّل اشتراك المستخدم فور نجاح الدفع بالنجوم", async () => {
+    stubs.claimTelegramUpdate.mockResolvedValue(true);
+    stubs.touchAndAdmitUser.mockResolvedValue({ admission: "active", isNew: false });
+    stubs.isPrimaryOwner.mockResolvedValue(false);
+    stubs.findSubscriptionPlanById.mockResolvedValue({ id: "p1", name: "شهري", durationDays: 30, stars: 100, active: true, createdAt: new Date() });
+    await processTelegramUpdate({
+      update_id: 74,
+      message: {
+        message_id: 40, chat: { id: 901, type: "private" }, from: { id: 901, first_name: "مستخدم" },
+        successful_payment: { invoice_payload: "sub:p1", telegram_payment_charge_id: "charge-1", provider_payment_charge_id: "p-1", currency: "XTR", total_amount: 100 },
+      },
+    } as never);
+    expect(stubs.setUserSubscription).toHaveBeenCalledWith("901", expect.any(Number), "p1");
+    expect(stubs.sendMessage).toHaveBeenCalledWith("901", expect.stringContaining("تم تفعيل اشتراكك"), expect.anything());
+  });
+
+  it("يرفض إتمام الدفع للحزمة المتوقفة عبر استعلام ما قبل الشحن", async () => {
+    stubs.claimTelegramUpdate.mockResolvedValue(true);
+    stubs.findSubscriptionPlanById.mockResolvedValue(undefined);
+    await processTelegramUpdate({
+      update_id: 75,
+      pre_checkout_query: { id: "pcq-1", from: { id: 901, first_name: "مستخدم" }, invoice_payload: "sub:ghost", currency: "XTR", total_amount: 100 },
+    } as never);
+    const { answerPreCheckoutQuery } = await import("./telegramApi");
+    expect(answerPreCheckoutQuery).toHaveBeenCalledWith("pcq-1", false, "الحزمة غير متاحة حالياً.");
   });
 });

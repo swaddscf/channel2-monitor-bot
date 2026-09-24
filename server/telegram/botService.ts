@@ -1,14 +1,15 @@
-import { addForcedSubscription, cancelLatestActiveJob, cancelMediaJob, claimTelegramUpdate, createMediaJob, deleteMediaJob, ensurePrimaryOwner, getMediaJob, getOwnerRole, getTelegramUser, isPrimaryOwner, listForcedSubscriptions, recordBotError, removeForcedSubscription, touchAndAdmitUser, updateMediaJob } from "./botDb";
+import { addForcedSubscription, addSubscriptionPlan, cancelLatestActiveJob, cancelMediaJob, claimTelegramUpdate, createMediaJob, deleteMediaJob, ensureBotSettings, ensurePrimaryOwner, findSubscriptionPlanById, getMediaJob, getOwnerRole, getTelegramUser, getUserAccess, isPrimaryOwner, listForcedSubscriptions, listSubscriptionPlans, recordBotError, recordUserDownload, removeForcedSubscription, setSubscriptionPlanActive, setUserSubscription, touchAndAdmitUser, updateMediaJob, updatePaidMode, updateUsageLimit, userDownloadsInWindow } from "./botDb";
 import { abortYtDlp, downloadAllImages, downloadMedia, DownloaderError, inspectMediaLink, purgeDownloadedMedia } from "./downloader";
 import { DownloadQueueError, getDownloadQueueStats, scheduleDownload } from "./downloadQueue";
 import { isValidTelegramUpdateId } from "./policy";
 import { inspectSupportedUrl, parseSubscriptionTarget, PublicLinkError } from "./validation";
-import { answerCallbackQuery, getChatMember, sendChatAction, sendDownloadedMedia, sendMediaGroup, sendMessage, sendWelcomePhoto } from "./telegramApi";
-import type { MediaChoice, TelegramCallbackQuery, TelegramMessage, TelegramUpdate } from "./types";
-import { escapeHtml, HELP_TEXT, inspectionText, mediaChoiceKeyboard, OWNER_CLEANUP_KEYBOARD, OWNER_KEYBOARD, OWNER_SETTINGS_KEYBOARD, OWNER_SUBSCRIPTIONS_KEYBOARD, OWNER_USERS_KEYBOARD, REPORT_TEXT, retryTikTokKeyboard, subscriptionGateKeyboard, subscriptionGateText, USER_KEYBOARD, welcomeText, type WelcomeUserInfo } from "./messages";
+import { answerCallbackQuery, answerPreCheckoutQuery, getChatMember, sendChatAction, sendDownloadedMedia, sendInvoice, sendMediaGroup, sendMessage, sendWelcomePhoto } from "./telegramApi";
+import type { MediaChoice, TelegramCallbackQuery, TelegramMessage, TelegramPreCheckoutQuery, TelegramUpdate } from "./types";
+import { escapeHtml, HELP_TEXT, inspectionText, limitsPageText, mediaChoiceKeyboard, OWNER_CLEANUP_KEYBOARD, OWNER_KEYBOARD, OWNER_LIMITS_KEYBOARD, OWNER_SETTINGS_KEYBOARD, OWNER_SUBSCRIPTIONS_KEYBOARD, OWNER_USERS_KEYBOARD, planCreatedText, planListText, REPORT_TEXT, retryTikTokKeyboard, subscriptionGateKeyboard, subscriptionGateText, subscriptionEndsLabel, subscriptionOfferKeyboard, usageLimitExceededText, USER_KEYBOARD, welcomeText, type WelcomeUserInfo } from "./messages";
 
 const recentRequests = new Map<string, number[]>();
-const pendingAdminInputs = new Map<string, { action: "ban" | "unban" | "cleanup" | "broadcast" | "addChannel" | "removeChannel"; expiresAt: number }>();
+const pendingAdminInputs = new Map<string, { action: "ban" | "unban" | "cleanup" | "broadcast" | "addChannel" | "removeChannel" | "limitCount" | "limitWindow" | "planName" | "planDays" | "planStars" | "stopPlan"; expiresAt: number }>();
+const planDrafts = new Map<string, { name: string; days: number }>();
 const pendingReports = new Map<string, number>();
 const ownerPageStacks = new Map<string, string[]>();
 let primaryOwnerEnsured = false;
@@ -26,6 +27,8 @@ const ownerControlLabels = new Set([
   "📊 الإحصاءات", "👥 إدارة المستخدمين", "👥 آخر المستخدمين", "✅ النشطون", "🌙 غير النشطين", "🚫 المحظورون",
   "🚫 حظر مستخدم", "✅ فك الحظر", "🔒 الاشتراك الإجباري", "➕ إضافة قناة/بوت", "➖ إزالة قناة/بوت", "📋 قائمة الاشتراك",
   "⚙️ الإعدادات", "⏱️ مدة التنظيف", "🧹 تنظيف البيانات", "🧹 تنظيف الآن", "📣 إرسال للجميع", "📋 أخطاء حديثة",
+  "💳 الحدود والاشتراك", "⏱️ عدد التنزيلات", "⏲️ النافذة (ساعات)", "✅ تشغيل حد الاستخدام", "🚫 حد: مجاني",
+  "💳 وضع البوت: مدفوع", "🆓 وضع البوت: مجاني", "➕ إضافة حزمة", "⛔ إيقاف حزمة", "📋 قائمة الحزم",
   "↩️ رجوع", "🏠 الرئيسية", "🛑 إلغاء العملية", "↩️ إلغاء الإدخال", "/admin",
 ]);
 
@@ -90,7 +93,7 @@ function isRetryableTikTokFailure(error: unknown, platform?: string) {
   return /TikTok.*(حماية المصدر|رفض|تعذر الوصول)|\[TikTok\].*Unexpected response from webpage request|Unexpected response from webpage request/i.test(message);
 }
 
-function beginAdminInput(telegramId: string, action: "ban" | "unban" | "cleanup" | "broadcast" | "addChannel" | "removeChannel") {
+function beginAdminInput(telegramId: string, action: "ban" | "unban" | "cleanup" | "broadcast" | "addChannel" | "removeChannel" | "limitCount" | "limitWindow" | "planName" | "planDays" | "planStars" | "stopPlan") {
   pendingAdminInputs.set(telegramId, { action, expiresAt: Date.now() + 10 * 60_000 });
 }
 
@@ -109,6 +112,7 @@ function ownerKeyboardFor(telegramId: string) {
   if (current === "settings") return OWNER_SETTINGS_KEYBOARD;
   if (current === "subscriptions") return OWNER_SUBSCRIPTIONS_KEYBOARD;
   if (current === "cleanup") return OWNER_CLEANUP_KEYBOARD;
+  if (current === "limits") return OWNER_LIMITS_KEYBOARD;
   return OWNER_KEYBOARD;
 }
 
@@ -229,13 +233,17 @@ async function sendAdminPanel(chatId: string, telegramId: string) {
   await sendMessage(chatId, "👑 <b>لوحة المالك الأساسية</b>\nاختر وظيفة من الأزرار. عند الحاجة لرقم أو نص سأطلبه منك في رسالة منفصلة.", { replyMarkup: OWNER_KEYBOARD });
 }
 
+async function sendLimitsPage(chatId: string) {
+  await sendMessage(chatId, limitsPageText(await ensureBotSettings()), { replyMarkup: OWNER_LIMITS_KEYBOARD });
+}
+
 async function sendUserList(chatId: string, title: string, users: Awaited<ReturnType<typeof import("./botDb")["listTelegramUsers"]>>, replyMarkup: Record<string, unknown>) {
   if (!users.length) return sendMessage(chatId, `لا توجد نتائج في قائمة «${title}».`, { replyMarkup });
   const lines = users.map((user, index) => `${index + 1}. <b>${escapeHtml(user.displayName)}</b>${user.username ? ` (@${escapeHtml(user.username)})` : ""}\n<code>${user.telegramId}</code> — ${user.status === "blocked" ? "محظور" : "نشط"}`);
   return sendMessage(chatId, `👥 <b>${title}</b>\n\n${lines.join("\n")}`, { replyMarkup });
 }
 
-function pendingInputPrompt(action: "ban" | "unban" | "cleanup" | "broadcast" | "addChannel" | "removeChannel") {
+function pendingInputPrompt(action: "ban" | "unban" | "cleanup" | "broadcast" | "addChannel" | "removeChannel" | "limitCount" | "limitWindow" | "planName" | "planDays" | "planStars" | "stopPlan") {
   const prompts: Record<typeof action, string> = {
     ban: "أرسل الآن رقم المستخدم أو @username لحظره.",
     unban: "أرسل الآن رقم المستخدم أو @username لفك الحظر.",
@@ -243,6 +251,12 @@ function pendingInputPrompt(action: "ban" | "unban" | "cleanup" | "broadcast" | 
     broadcast: "أرسل الآن نص الرسالة. ستصل للمستخدمين النشطين فقط.",
     addChannel: "أرسل معرف القناة أو المجموعة أو البوت:\n- @username\n- أو رقم القناة\n- أو رابط t.me/username",
     removeChannel: "أرسل معرف القناة أو @username أو معرّفها من قائمة الاشتراك.",
+    limitCount: "أرسل عدد التنزيلات المسموح لكل مستخدم خلال النافذة (1 إلى 1000).",
+    limitWindow: "أرسل مدة النافذة بالساعات (1 إلى 8760). مثال: 12 لكل يومين، و24 ليوم كامل.",
+    planName: "أرسل اسم الحزمة (مثال: أسبوعي أو شهري).",
+    planDays: "أرسل مدة الحزمة بالأيام (مثال: 7 لأسبوع، و30 لشهر).",
+    planStars: "أرسل السعر بالنجوم ⭐ (رقماً صحيحاً).",
+    stopPlan: "أرسل اسم الحزمة التي تريد إيقافها، من قائمة الحزم.",
   };
   return prompts[action];
 }
@@ -284,6 +298,34 @@ async function handleOwnerButton(message: TelegramMessage, text: string) {
   if (text === "🧹 تنظيف البيانات") {
     ownerStack(telegramId).push("cleanup");
     await sendMessage(chatId, "🧹 <b>تنظيف البيانات</b>", { replyMarkup: OWNER_CLEANUP_KEYBOARD });
+    return true;
+  }
+  if (text === "💳 الحدود والاشتراك") {
+    ownerStack(telegramId).push("limits");
+    return sendLimitsPage(chatId);
+  }
+  if (text === "📋 قائمة الحزم") {
+    await sendMessage(chatId, planListText(await listSubscriptionPlans()), { replyMarkup: OWNER_LIMITS_KEYBOARD });
+    return true;
+  }
+  if (text === "✅ تشغيل حد الاستخدام") {
+    await updateUsageLimit({ enabled: true });
+    await sendMessage(chatId, "✅ تم تشغيل حد الاستخدام.", { replyMarkup: OWNER_LIMITS_KEYBOARD });
+    return true;
+  }
+  if (text === "🚫 حد: مجاني") {
+    await updateUsageLimit({ enabled: false });
+    await sendMessage(chatId, "🚫 تم إلغاء الحد. البوت الآن مجاني بلا موقت.", { replyMarkup: OWNER_LIMITS_KEYBOARD });
+    return true;
+  }
+  if (text === "💳 وضع البوت: مدفوع") {
+    await updatePaidMode(true);
+    await sendMessage(chatId, "💳 تم تفعيل الوضع المدفوع. ستظهر حزم الاشتراك لمن استنفد حصته.", { replyMarkup: OWNER_LIMITS_KEYBOARD });
+    return true;
+  }
+  if (text === "🆓 وضع البوت: مجاني") {
+    await updatePaidMode(false);
+    await sendMessage(chatId, "🆓 أُطفئ الوضع المدفوع. لن تظهر أزرار الاشتراك.", { replyMarkup: OWNER_LIMITS_KEYBOARD });
     return true;
   }
   if (text === "📊 الإحصاءات") {
@@ -347,13 +389,17 @@ async function handleOwnerButton(message: TelegramMessage, text: string) {
     await sendMessage(chatId, cancelled ? "تم إلغاء آخر عملية نشطة." : "لا توجد عملية قابلة للإلغاء.", { replyMarkup: keyboardFor(true) });
     return true;
   }
-  const inputs: Record<string, { action: "ban" | "unban" | "cleanup" | "broadcast" | "addChannel" | "removeChannel" }> = {
+  const inputs: Record<string, { action: "ban" | "unban" | "cleanup" | "broadcast" | "addChannel" | "removeChannel" | "limitCount" | "limitWindow" | "planName" | "planDays" | "planStars" | "stopPlan" }> = {
     "🚫 حظر مستخدم": { action: "ban" },
     "✅ فك الحظر": { action: "unban" },
     "⏱️ مدة التنظيف": { action: "cleanup" },
     "📣 إرسال للجميع": { action: "broadcast" },
     "➕ إضافة قناة/بوت": { action: "addChannel" },
     "➖ إزالة قناة/بوت": { action: "removeChannel" },
+    "⏱️ عدد التنزيلات": { action: "limitCount" },
+    "⏲️ النافذة (ساعات)": { action: "limitWindow" },
+    "➕ إضافة حزمة": { action: "planName" },
+    "⛔ إيقاف حزمة": { action: "stopPlan" },
   };
   if (inputs[text]) {
     beginAdminInput(telegramId, inputs[text].action);
@@ -379,6 +425,38 @@ async function handlePendingAdminInput(message: TelegramMessage, text: string) {
   }
   const chatId = String(message.chat.id);
   const replyMarkup = ownerKeyboardFor(telegramId);
+  if (pending.action === "planName" || pending.action === "planDays" || pending.action === "planStars") {
+    pendingAdminInputs.delete(telegramId);
+    try {
+      if (pending.action === "planName") {
+        const name = text.trim().slice(0, 60);
+        if (!name) throw new Error("اكتب اسماً صحيحاً للحزمة.");
+        planDrafts.set(telegramId, { name, days: 0 });
+        beginAdminInput(telegramId, "planDays");
+        await sendMessage(chatId, "✍️ أرسل مدة الحزمة بالأيام (مثال: 7 لأسبوع، 30 لشهر).");
+      } else if (pending.action === "planDays") {
+        const draft = planDrafts.get(telegramId);
+        const days = Number(text.trim());
+        if (!draft) throw new Error("ابدأ من جديد بطلب «إضافة حزمة».");
+        if (!Number.isInteger(days) || days < 1 || days > 3650) throw new Error("أرسل عدداً صحيحاً من الأيام بين 1 و3650.");
+        planDrafts.set(telegramId, { ...draft, days });
+        beginAdminInput(telegramId, "planStars");
+        await sendMessage(chatId, "✍️ أرسل السعر بالنجوم ⭐ (رقماً صحيحاً).");
+      } else {
+        const draft = planDrafts.get(telegramId);
+        const stars = Number(text.trim());
+        if (!draft?.name || !draft.days) throw new Error("ابدأ من جديد بطلب «إضافة حزمة».");
+        if (!Number.isInteger(stars) || stars < 1 || stars > 100_000) throw new Error("أرسل عدد نجوم صحيحاً بين 1 و100000.");
+        const plan = await addSubscriptionPlan({ name: draft.name, durationDays: draft.days, stars });
+        planDrafts.delete(telegramId);
+        await sendMessage(chatId, planCreatedText(plan), { replyMarkup: OWNER_LIMITS_KEYBOARD });
+        await notifyOwners(`💳 <b>إضافة حزمة اشتراك</b>\nالاسم: <b>${escapeHtml(plan.name)}</b>\nالمدة: <b>${plan.durationDays} يوم</b>\nالسعر: <b>${plan.stars} ⭐</b>`);
+      }
+    } catch (error) {
+      await sendMessage(chatId, `تعذر التنفيذ: <b>${escapeHtml(error instanceof Error ? error.message : "خطأ غير متوقع")}</b>`, { replyMarkup: ownerKeyboardFor(telegramId) });
+    }
+    return true;
+  }
   const { activeRecipients, setTelegramUserBlocked, updateCleanupInactiveDays } = await import("./botDb");
   try {
     if (pending.action === "ban" || pending.action === "unban") {
@@ -401,6 +479,21 @@ async function handlePendingAdminInput(message: TelegramMessage, text: string) {
       if (!removed) throw new Error("لم يتم العثور على هذا الاشتراك. تحقق من المعرّف.");
       await notifyOwners(`🔓 <b>إزالة اشتراك إجباري</b>\nالمعرّف: <code>${escapeHtml(text.trim())}</code>`);
       await sendMessage(chatId, "✅ تمت إزالة الاشتراك بنجاح.", { replyMarkup });
+    } else if (pending.action === "limitCount") {
+      const value = Number(text.trim());
+      if (!Number.isInteger(value) || value < 1 || value > 1000) throw new Error("أدخل عدد تنزيلات بين 1 و1000.");
+      await updateUsageLimit({ count: value, enabled: true });
+      await sendMessage(chatId, `تم ضبط حد التنزيل: <b>${value}</b> تنزيل لكل نافذة. البوت الآن محدود.`, { replyMarkup });
+    } else if (pending.action === "limitWindow") {
+      const value = Number(text.trim());
+      if (!Number.isInteger(value) || value < 1 || value > 8_760) throw new Error("أدخل عدد ساعات بين 1 و8760.");
+      await updateUsageLimit({ windowHours: value });
+      await sendMessage(chatId, `تم ضبط نافذة الحد: <b>${value}</b> ساعة.`, { replyMarkup });
+    } else if (pending.action === "stopPlan") {
+      const stopped = await setSubscriptionPlanActive(text, false);
+      if (!stopped) throw new Error("لم يتم العثور على حزمة بهذا الاسم. تحقق من قائمة الحزم.");
+      await notifyOwners(`⛔ <b>إيقاف حزمة</b>\nالحزمة: <b>${escapeHtml(text.trim())}</b>`);
+      await sendMessage(chatId, `⛔ أُوقفت الحزمة «<b>${escapeHtml(text.trim())}</b>». لن تظهر لعملاء جدد.`, { replyMarkup });
     } else {
       const content = text.trim();
       if (!content || content.length > 3500) throw new Error("اكتب رسالة بين 1 و3500 حرفاً.");
@@ -424,6 +517,7 @@ async function handlePendingAdminInput(message: TelegramMessage, text: string) {
 
 async function handleMessage(message: TelegramMessage) {
   const admission = await admitMessage(message);
+  if (message.successful_payment) return handleSuccessfulPayment(message);
   if (!admission.admitted || !message.text) return;
   const text = message.text.trim();
   const chatId = String(message.chat.id);
@@ -484,6 +578,31 @@ async function handleMessage(message: TelegramMessage) {
   await inspectIncomingLink(message, text, admission.primary);
 }
 
+async function handleSuccessfulPayment(message: TelegramMessage) {
+  const payment = message.successful_payment!;
+  const telegramId = String(message.from!.id);
+  const chatId = String(message.chat.id);
+  const primary = await isPrimaryOwner(telegramId);
+  const planId = payment.invoice_payload.replace(/^sub:/, "");
+  const plan = await findSubscriptionPlanById(planId);
+  if (!plan) {
+    return sendMessage(chatId, "تم استلام مدفوعاتك، لكن تعذر التعرف على الحزمة. تواصل مع المالك.", { replyMarkup: keyboardFor(primary) });
+  }
+  const access = await getUserAccess(telegramId);
+  const base = Math.max(Date.now(), access.subscriptionExpiresAt || 0);
+  const expiresAt = base + plan.durationDays * 86_400_000;
+  await setUserSubscription(telegramId, expiresAt, plan.id);
+  await notifyOwners(`💰 <b>اشتراك جديد بالنجوم</b>\nالمستخدم: <code>${escapeHtml(telegramId)}</code>\nالحزمة: <b>${escapeHtml(plan.name)}</b>\nالمدة: <b>${plan.durationDays} يوم</b>\nالسعر: <b>${plan.stars} ⭐</b>\nينتهي: <b>${subscriptionEndsLabel(expiresAt)}</b>\nالتزام: <code>${escapeHtml(payment.telegram_payment_charge_id)}</code>`);
+  return sendMessage(chatId, `✅ <b>تم تفعيل اشتراكك بنجاح!</b>\n\nالحزمة: <b>${escapeHtml(plan.name)}</b>\nالمدة: <b>${plan.durationDays} يوم</b>\nينتهي: <b>${subscriptionEndsLabel(expiresAt)}</b>\n\nتنزيلاتك مفتوحة الآن بلا حدود. شكراً لدعمك 🎉`, { replyMarkup: keyboardFor(primary) });
+}
+
+async function handlePreCheckoutQuery(query: TelegramPreCheckoutQuery) {
+  const planId = query.invoice_payload.replace(/^sub:/, "");
+  const plan = await findSubscriptionPlanById(planId);
+  if (!plan || !plan.active) return answerPreCheckoutQuery(query.id, false, "الحزمة غير متاحة حالياً.");
+  return answerPreCheckoutQuery(query.id, true);
+}
+
 async function handleDownloadCallback(callback: TelegramCallbackQuery) {
   const chatId = callback.message ? String(callback.message.chat.id) : String(callback.from.id);
   const data = callback.data || "";
@@ -521,6 +640,26 @@ async function handleDownloadCallback(callback: TelegramCallbackQuery) {
     }, retryJob.sourceUrl, primary);
     return;
   }
+  if (data === "sub_dismiss") return answerCallbackQuery(callback.id, "حسناً. ستظل الحصة الحالية متاحة.");
+  if (data.startsWith("sub_plan:")) {
+    if (!allowCallback(senderId)) return answerCallbackQuery(callback.id, "💡 أنت تضغط بسرعة. انتظر قليلاً ثم أعد المحاولة.");
+    const planId = data.slice("sub_plan:".length);
+    const plan = await findSubscriptionPlanById(planId);
+    if (!plan || !plan.active) return answerCallbackQuery(callback.id, "الحزمة غير متاحة حالياً");
+    await answerCallbackQuery(callback.id, "جارٍ تجهيز فاتورة الدفع ⭐…");
+    try {
+      await sendInvoice(chatId, {
+        title: `اشتراك ${plan.name}`,
+        description: `تفعيل تنزيلات بلا حدود لمدة ${plan.durationDays} يوماً مقابل ${plan.stars} نجمة.`,
+        payload: `sub:${plan.id}`,
+        stars: plan.stars,
+      });
+    } catch (error) {
+      console.error("[Telegram Stars] sendInvoice failed", error);
+      await sendMessage(chatId, "تعذر إنشاء فاتورة الدفع حالياً. تأكد من توفر نجوم تواصل أو حاول لاحقاً.", { replyMarkup: keyboardFor(primary) });
+    }
+    return;
+  }
   const parts = data.split(":");
   const jobId = parts[1];
   const rawChoice = parts[2];
@@ -530,6 +669,23 @@ async function handleDownloadCallback(callback: TelegramCallbackQuery) {
   if (!allowCallback(senderId)) return answerCallbackQuery(callback.id, "💡 أنت تضغط بسرعة. انتظر قليلاً ثم أعد المحاولة.");
   const job = await getMediaJob(jobId);
   if (!job || job.telegramId !== senderId || job.status !== "ready" || job.cancelRequested) return answerCallbackQuery(callback.id, "انتهت صلاحية هذا الطلب");
+  const settings = await ensureBotSettings();
+  if (!primary && settings.usageLimitEnabled) {
+    const access = await getUserAccess(senderId);
+    const subscribed = Boolean(access.subscriptionExpiresAt && access.subscriptionExpiresAt > Date.now());
+    if (!subscribed) {
+      const used = await userDownloadsInWindow(senderId, settings.usageLimitWindowHours);
+      if (used >= settings.usageLimitCount) {
+        const plans = await listSubscriptionPlans();
+        const hasActivePlans = plans.some(plan => plan.active);
+        await answerCallbackQuery(callback.id, hasActivePlans ? "انتهت حصتك المجانية" : "انتهت حصتك اليومية");
+        if (hasActivePlans && settings.paidModeEnabled) {
+          return sendMessage(chatId, usageLimitExceededText(settings.usageLimitCount, settings.usageLimitWindowHours, true), { replyMarkup: subscriptionOfferKeyboard(plans) });
+        }
+        return sendMessage(chatId, usageLimitExceededText(settings.usageLimitCount, settings.usageLimitWindowHours, false), { replyMarkup: keyboardFor(primary) });
+      }
+    }
+  }
   await answerCallbackQuery(callback.id, allImages ? "بدأ تجهيز الصور" : "بدأ تجهيز الملف");
   await updateMediaJob(jobId, { status: "downloading", selectedChoice: choice });
   const action: "upload_video" | "upload_audio" | "upload_photo" = allImages || choice === "image" ? "upload_photo" : choice === "audio" ? "upload_audio" : "upload_video";
@@ -562,6 +718,7 @@ async function handleDownloadCallback(callback: TelegramCallbackQuery) {
     }
     await updateMediaJob(jobId, { status: "sent" });
     await notifyOwners(`✅ <b>تنزيل مكتمل</b>\nالمستخدم: <code>${senderId}</code>\nالنوع: <b>${allImages ? "صور كاملة" : mediaLabel(choice)}</b>\nالحجم: <b>${Math.round(output.bytes / 1024)} KB</b>\nالرابط: <code>${escapeHtml(job.sourceUrl.slice(0, 500))}</code>`);
+    if (!primary) await recordUserDownload(senderId, settings.usageLimitWindowHours);
   } catch (error) {
     if (error instanceof DownloaderError && error.message === "تم إلغاء العملية بنجاح.") return;
     if (error instanceof DownloadQueueError) {
@@ -588,10 +745,11 @@ export async function processTelegramUpdate(update: TelegramUpdate) {
   if (!isValidTelegramUpdateId(update.update_id)) return;
   if (!(await claimTelegramUpdate(update.update_id))) return;
   try {
+    if (update.pre_checkout_query) return handlePreCheckoutQuery(update.pre_checkout_query);
     if (update.message) return handleMessage(update.message);
     if (update.callback_query) return handleDownloadCallback(update.callback_query);
   } catch (error) {
-    const telegramId = update.message?.from ? String(update.message.from.id) : update.callback_query ? String(update.callback_query.from.id) : undefined;
+    const telegramId = update.message?.from ? String(update.message.from.id) : update.callback_query ? String(update.callback_query.from.id) : update.pre_checkout_query ? String(update.pre_checkout_query.from.id) : undefined;
     await notifyError({ telegramId, stage: "معالجة تحديث Telegram", error });
     throw error;
   }

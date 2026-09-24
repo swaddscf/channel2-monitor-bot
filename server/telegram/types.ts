@@ -39,6 +39,7 @@ export type TelegramMessage = {
   chat: { id: number | string; type: string };
   from?: TelegramFrom;
   text?: string;
+  successful_payment?: TelegramSuccessfulPayment;
 };
 
 export type TelegramCallbackQuery = {
@@ -52,6 +53,7 @@ export type TelegramUpdate = {
   update_id: number;
   message?: TelegramMessage;
   callback_query?: TelegramCallbackQuery;
+  pre_checkout_query?: TelegramPreCheckoutQuery;
 };
 
 export type ForcedSubscriptionKind = "channel" | "group" | "bot";
@@ -63,4 +65,29 @@ export type ForcedSubscription = {
   label: string;
   kind: ForcedSubscriptionKind;
   createdAt: Date;
+};
+
+export type SubscriptionPlan = {
+  id: string;
+  name: string;
+  durationDays: number;
+  stars: number;
+  active: boolean;
+  createdAt: Date;
+};
+
+export type TelegramSuccessfulPayment = {
+  currency: string;
+  total_amount: number;
+  invoice_payload: string;
+  telegram_payment_charge_id: string;
+  provider_payment_charge_id?: string;
+};
+
+export type TelegramPreCheckoutQuery = {
+  id: string;
+  from: TelegramFrom;
+  currency: string;
+  total_amount: number;
+  invoice_payload: string;
 };

@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  KEEP_ALIVE_URL: "https://channel2monitorbot-9964ob2i.b4a.run/healthz"
+  KEEP_ALIVE_URL: "https://channel2monitorbot-fi1q8s05.b4a.run/healthz"
 
 jobs:
   ping:

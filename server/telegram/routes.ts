@@ -22,6 +22,10 @@ async function ensureTelegramWebhook(webhookUrl: string, secret: string) {
 }
 
 export function registerTelegramRoutes(app: Express) {
+  app.get("/healthz", (_req: Request, res: Response) => {
+    res.json({ ok: true, uptimeSeconds: Math.round(process.uptime()), polling: isPollingEnabled() });
+  });
+
   app.get("/api/telegram/status", async (_req: Request, res: Response) => {
     res.json({ ok: true, ...(await getTelegramIntegrationStatus()) });
   });

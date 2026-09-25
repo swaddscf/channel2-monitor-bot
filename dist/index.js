@@ -4534,6 +4534,9 @@ async function ensureTelegramWebhook(webhookUrl, secret) {
   return { url: updated.url || null, pendingUpdates: updated.pending_update_count || 0, reused: false };
 }
 function registerTelegramRoutes(app) {
+  app.get("/healthz", (_req, res) => {
+    res.json({ ok: true, uptimeSeconds: Math.round(process.uptime()), polling: isPollingEnabled() });
+  });
   app.get("/api/telegram/status", async (_req, res) => {
     res.json({ ok: true, ...await getTelegramIntegrationStatus() });
   });

@@ -1,0 +1,22 @@
+name: keep-alive
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+concurrency:
+  group: keep-alive
+  cancel-in-progress: true
+
+env:
+  KEEP_ALIVE_URL: "https://channel2monitorbot-9964ob2i.b4a.run/healthz"
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Wake the container
+        run: curl -fsS --retry 3 --retry-delay 5 --max-time 30 -o /dev/null "$KEEP_ALIVE_URL"

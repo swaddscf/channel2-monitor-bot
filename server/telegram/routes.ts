@@ -74,12 +74,13 @@ export function registerTelegramRoutes(app: Express) {
     if (!matchesWebhookSecret(secret, suppliedSecret)) {
       return res.status(403).json({ ok: false, error: "invalid webhook secret" });
     }
-    try {
-      await processTelegramUpdate(req.body as TelegramUpdate);
-      return res.status(200).json({ ok: true });
-    } catch (error) {
+    const update = req.body as TelegramUpdate;
+    // Acknowledge Telegram immediately. Long downloads must not keep the webhook
+    // request open, otherwise Telegram retries the update and causes duplicate work.
+    res.status(200).json({ ok: true });
+    void processTelegramUpdate(update).catch(error => {
       console.error("[Telegram webhook] Update processing failed", error);
-      return res.status(500).json({ ok: false });
-    }
+    });
+    return;
   });
 }

@@ -5,10 +5,11 @@ import { isValidTelegramUpdateId } from "./policy";
 import { inspectSupportedUrl, parseSubscriptionTarget, PublicLinkError } from "./validation";
 import { answerCallbackQuery, answerPreCheckoutQuery, getChatMember, sendChatAction, sendDownloadedMedia, sendInvoice, sendMediaGroup, sendMessage, sendWelcomePhoto } from "./telegramApi";
 import type { MediaChoice, TelegramCallbackQuery, TelegramMessage, TelegramPreCheckoutQuery, TelegramUpdate } from "./types";
-import { escapeHtml, HELP_TEXT, inspectionText, limitsPageText, mediaChoiceKeyboard, OWNER_CLEANUP_KEYBOARD, OWNER_KEYBOARD, OWNER_LIMITS_KEYBOARD, OWNER_SETTINGS_KEYBOARD, OWNER_SUBSCRIPTIONS_KEYBOARD, OWNER_USERS_KEYBOARD, planCreatedText, planListText, REPORT_TEXT, retryTikTokKeyboard, subscriptionGateKeyboard, subscriptionGateText, subscriptionEndsLabel, subscriptionOfferKeyboard, usageLimitExceededText, USER_KEYBOARD, welcomeText, type WelcomeUserInfo } from "./messages";
+import { escapeHtml, HELP_TEXT, inspectionText, limitsPageText, mediaChoiceKeyboard, OWNER_CLEANUP_KEYBOARD, OWNER_KEYBOARD, OWNER_LIMITS_KEYBOARD, OWNER_SETTINGS_KEYBOARD, OWNER_SPAM_KEYBOARD, OWNER_SUBSCRIPTIONS_KEYBOARD, OWNER_USERS_KEYBOARD, planCreatedText, planListText, premiumListText, REPORT_TEXT, retryTikTokKeyboard, SPAM_SOFT_LIMIT_TEXT, spamMutedText, spamPageText, subscriptionGateKeyboard, subscriptionGateText, subscriptionEndsLabel, subscriptionOfferKeyboard, usageLimitExceededText, USER_KEYBOARD, welcomeText, type WelcomeUserInfo } from "./messages";
+import { addPremiumUser, checkMessageSpam, getProtectionSettings, isPremiumUser, listPremiumUsers, removePremiumUser, setSpamMuteMinutes } from "./protection";
 
 const recentRequests = new Map<string, number[]>();
-const pendingAdminInputs = new Map<string, { action: "ban" | "unban" | "cleanup" | "broadcast" | "addChannel" | "removeChannel" | "limitCount" | "limitWindow" | "planName" | "planDays" | "planStars" | "stopPlan"; expiresAt: number }>();
+const pendingAdminInputs = new Map<string, { action: "ban" | "unban" | "cleanup" | "broadcast" | "addChannel" | "removeChannel" | "limitCount" | "limitWindow" | "planName" | "planDays" | "planStars" | "stopPlan" | "spamMute" | "addPremium" | "removePremium"; expiresAt: number }>();
 const planDrafts = new Map<string, { name: string; days: number }>();
 const pendingReports = new Map<string, number>();
 const ownerPageStacks = new Map<string, string[]>();
@@ -29,6 +30,7 @@ const ownerControlLabels = new Set([
   "⚙️ الإعدادات", "⏱️ مدة التنظيف", "🧹 تنظيف البيانات", "🧹 تنظيف الآن", "📣 إرسال للجميع", "📋 أخطاء حديثة",
   "💳 الحدود والاشتراك", "⏱️ عدد التنزيلات", "⏲️ النافذة (ساعات)", "✅ تشغيل حد الاستخدام", "🚫 حد: مجاني",
   "💳 وضع البوت: مدفوع", "🆓 وضع البوت: مجاني", "➕ إضافة حزمة", "⛔ إيقاف حزمة", "📋 قائمة الحزم",
+  "🛡 حماية السبام", "⏱️ مدة التقييد", "⭐ إضافة مستخدم مميز", "✖️ إزالة مستخدم مميز", "🌟 المميزون",
   "↩️ رجوع", "🏠 الرئيسية", "🛑 إلغاء العملية", "↩️ إلغاء الإدخال", "/admin",
 ]);
 
@@ -93,7 +95,30 @@ function isRetryableTikTokFailure(error: unknown, platform?: string) {
   return /TikTok.*(حماية المصدر|رفض|تعذر الوصول)|\[TikTok\].*Unexpected response from webpage request|Unexpected response from webpage request/i.test(message);
 }
 
-function beginAdminInput(telegramId: string, action: "ban" | "unban" | "cleanup" | "broadcast" | "addChannel" | "removeChannel" | "limitCount" | "limitWindow" | "planName" | "planDays" | "planStars" | "stopPlan") {
+// Automatic retry for transient source failures: the bot retries silently a
+// couple of times before surfacing any error to the user.
+const AUTO_RETRY_DELAYS_MS = [3_000, 6_000];
+
+function delay(ms: number) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function withAutoRetry<T>(platform: string, operation: () => Promise<T>): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= AUTO_RETRY_DELAYS_MS.length; attempt += 1) {
+    if (attempt) await delay(AUTO_RETRY_DELAYS_MS[attempt - 1]);
+    try {
+      return await operation();
+    } catch (error) {
+      if (error instanceof DownloaderError && error.message === "تم إلغاء العملية بنجاح.") throw error;
+      lastError = error;
+      if (!isRetryableTikTokFailure(error, platform)) throw error;
+    }
+  }
+  throw lastError;
+}
+
+function beginAdminInput(telegramId: string, action: "ban" | "unban" | "cleanup" | "broadcast" | "addChannel" | "removeChannel" | "limitCount" | "limitWindow" | "planName" | "planDays" | "planStars" | "stopPlan" | "spamMute" | "addPremium" | "removePremium") {
   pendingAdminInputs.set(telegramId, { action, expiresAt: Date.now() + 10 * 60_000 });
 }
 
@@ -113,6 +138,7 @@ function ownerKeyboardFor(telegramId: string) {
   if (current === "subscriptions") return OWNER_SUBSCRIPTIONS_KEYBOARD;
   if (current === "cleanup") return OWNER_CLEANUP_KEYBOARD;
   if (current === "limits") return OWNER_LIMITS_KEYBOARD;
+  if (current === "spam") return OWNER_SPAM_KEYBOARD;
   return OWNER_KEYBOARD;
 }
 
@@ -205,7 +231,7 @@ async function inspectIncomingLink(message: TelegramMessage, rawUrl: string, pri
   await sendChatAction(chatId, "typing").catch(() => undefined);
   await sendMessage(chatId, "⌛ <b>جارٍ فحص الرابط…</b> ستظهر خيارات التنزيل المتاحة تلقائياً. يمكنك الضغط على «إلغاء العملية» في أي وقت.", { replyMarkup: keyboardFor(primary) });
   try {
-    const result = await inspectMediaLink(rawUrl, jobId);
+    const result = await withAutoRetry(platform, () => inspectMediaLink(rawUrl, jobId));
     const job = await getMediaJob(jobId);
     if (!job || job.cancelRequested) return;
     await updateMediaJob(jobId, { status: "ready", choicesJson: JSON.stringify(result.choices) });
@@ -243,7 +269,7 @@ async function sendUserList(chatId: string, title: string, users: Awaited<Return
   return sendMessage(chatId, `👥 <b>${title}</b>\n\n${lines.join("\n")}`, { replyMarkup });
 }
 
-function pendingInputPrompt(action: "ban" | "unban" | "cleanup" | "broadcast" | "addChannel" | "removeChannel" | "limitCount" | "limitWindow" | "planName" | "planDays" | "planStars" | "stopPlan") {
+function pendingInputPrompt(action: "ban" | "unban" | "cleanup" | "broadcast" | "addChannel" | "removeChannel" | "limitCount" | "limitWindow" | "planName" | "planDays" | "planStars" | "stopPlan" | "spamMute" | "addPremium" | "removePremium") {
   const prompts: Record<typeof action, string> = {
     ban: "أرسل الآن رقم المستخدم أو @username لحظره.",
     unban: "أرسل الآن رقم المستخدم أو @username لفك الحظر.",
@@ -257,6 +283,9 @@ function pendingInputPrompt(action: "ban" | "unban" | "cleanup" | "broadcast" | 
     planDays: "أرسل مدة الحزمة بالأيام (مثال: 7 لأسبوع، و30 لشهر).",
     planStars: "أرسل السعر بالنجوم ⭐ (رقماً صحيحاً).",
     stopPlan: "أرسل اسم الحزمة التي تريد إيقافها، من قائمة الحزم.",
+    spamMute: "أرسل مدة تقييد السبام بالدقائق (1 إلى 1440).",
+    addPremium: "أرسل المعرّف الرقمي للمستخدم، أو @username لمستخدم بدأ البوت مسبقاً.",
+    removePremium: "أرسل المعرّف الرقمي للمستخدم المميز أو @username لإزالة الميزة.",
   };
   return prompts[action];
 }
@@ -303,6 +332,21 @@ async function handleOwnerButton(message: TelegramMessage, text: string) {
   if (text === "💳 الحدود والاشتراك") {
     ownerStack(telegramId).push("limits");
     return sendLimitsPage(chatId);
+  }
+  if (text === "🛡 حماية السبام") {
+    ownerStack(telegramId).push("spam");
+    const protection = await getProtectionSettings();
+    await sendMessage(chatId, spamPageText(protection, (await listPremiumUsers()).length), { replyMarkup: OWNER_SPAM_KEYBOARD });
+    return true;
+  }
+  if (text === "🌟 المميزون") {
+    const entries: Array<{ telegramId: string; displayName: string | null }> = [];
+    for (const premiumId of await listPremiumUsers()) {
+      const user = await getTelegramUser(premiumId);
+      entries.push({ telegramId: premiumId, displayName: user?.displayName ?? null });
+    }
+    await sendMessage(chatId, premiumListText(entries), { replyMarkup: OWNER_USERS_KEYBOARD });
+    return true;
   }
   if (text === "📋 قائمة الحزم") {
     await sendMessage(chatId, planListText(await listSubscriptionPlans()), { replyMarkup: OWNER_LIMITS_KEYBOARD });
@@ -389,7 +433,7 @@ async function handleOwnerButton(message: TelegramMessage, text: string) {
     await sendMessage(chatId, cancelled ? "تم إلغاء آخر عملية نشطة." : "لا توجد عملية قابلة للإلغاء.", { replyMarkup: keyboardFor(true) });
     return true;
   }
-  const inputs: Record<string, { action: "ban" | "unban" | "cleanup" | "broadcast" | "addChannel" | "removeChannel" | "limitCount" | "limitWindow" | "planName" | "planDays" | "planStars" | "stopPlan" }> = {
+  const inputs: Record<string, { action: "ban" | "unban" | "cleanup" | "broadcast" | "addChannel" | "removeChannel" | "limitCount" | "limitWindow" | "planName" | "planDays" | "planStars" | "stopPlan" | "spamMute" | "addPremium" | "removePremium" }> = {
     "🚫 حظر مستخدم": { action: "ban" },
     "✅ فك الحظر": { action: "unban" },
     "⏱️ مدة التنظيف": { action: "cleanup" },
@@ -400,6 +444,9 @@ async function handleOwnerButton(message: TelegramMessage, text: string) {
     "⏲️ النافذة (ساعات)": { action: "limitWindow" },
     "➕ إضافة حزمة": { action: "planName" },
     "⛔ إيقاف حزمة": { action: "stopPlan" },
+    "⏱️ مدة التقييد": { action: "spamMute" },
+    "⭐ إضافة مستخدم مميز": { action: "addPremium" },
+    "✖️ إزالة مستخدم مميز": { action: "removePremium" },
   };
   if (inputs[text]) {
     beginAdminInput(telegramId, inputs[text].action);
@@ -494,6 +541,28 @@ async function handlePendingAdminInput(message: TelegramMessage, text: string) {
       if (!stopped) throw new Error("لم يتم العثور على حزمة بهذا الاسم. تحقق من قائمة الحزم.");
       await notifyOwners(`⛔ <b>إيقاف حزمة</b>\nالحزمة: <b>${escapeHtml(text.trim())}</b>`);
       await sendMessage(chatId, `⛔ أُوقفت الحزمة «<b>${escapeHtml(text.trim())}</b>». لن تظهر لعملاء جدد.`, { replyMarkup });
+    } else if (pending.action === "spamMute") {
+      const value = Number(text.trim());
+      if (!Number.isInteger(value) || value < 1 || value > 1440) throw new Error("أدخل مدة بالدقائق بين 1 و1440.");
+      await setSpamMuteMinutes(value);
+      await notifyOwners(`🛡 <b>تعديل مدة تقييد السبام</b>\nالمدة الجديدة: <b>${value} دقيقة</b>\nبواسطة: <code>${telegramId}</code>`);
+      await sendMessage(chatId, `✅ تم ضبط مدة تقييد السبام: <b>${value}</b> دقيقة.`, { replyMarkup: OWNER_SPAM_KEYBOARD });
+    } else if (pending.action === "addPremium" || pending.action === "removePremium") {
+      const { findTelegramUser } = await import("./botDb");
+      const normalized = text.trim().replace(/^@/, "");
+      const targetId = /^\d+$/.test(normalized) ? normalized : (await findTelegramUser(text))?.telegramId;
+      if (!targetId) throw new Error("أرسل المعرّف الرقمي للمستخدم، أو @username لمستخدم بدأ البوت مسبقاً.");
+      if (pending.action === "addPremium") {
+        const added = await addPremiumUser(targetId);
+        if (!added) throw new Error("هذا المستخدم مميز بالفعل.");
+        await notifyOwners(`⭐ <b>إضافة مستخدم مميز</b>\nالمستخدم: <code>${targetId}</code>\nبواسطة: <code>${telegramId}</code>`);
+        await sendMessage(chatId, `✅ أصبح المستخدم <code>${targetId}</code> مميزاً: تنزيلات بلا حدود ومعفى من قيود السبام والاشتراك الإجباري.`, { replyMarkup });
+      } else {
+        const removed = await removePremiumUser(targetId);
+        if (!removed) throw new Error("هذا المستخدم غير موجود في قائمة المميزين.");
+        await notifyOwners(`✖️ <b>إزالة مستخدم مميز</b>\nالمستخدم: <code>${targetId}</code>\nبواسطة: <code>${telegramId}</code>`);
+        await sendMessage(chatId, `✅ أُزيلت الميزة عن المستخدم <code>${targetId}</code>.`, { replyMarkup });
+      }
     } else {
       const content = text.trim();
       if (!content || content.length > 3500) throw new Error("اكتب رسالة بين 1 و3500 حرفاً.");
@@ -522,9 +591,24 @@ async function handleMessage(message: TelegramMessage) {
   const text = message.text.trim();
   const chatId = String(message.chat.id);
   const telegramId = String(message.from!.id);
+  const premium = await isPremiumUser(telegramId);
+
+  // Spam protection: soft-limit warning first, automatic temporary mute on repeat.
+  const spam = await checkMessageSpam(telegramId, admission.primary || premium);
+  if (!spam.allowed) {
+    const minutesLeft = Math.max(1, Math.ceil(((spam.mutedUntil ?? Date.now()) - Date.now()) / 60_000));
+    if (spam.newlyMuted) {
+      const protection = await getProtectionSettings();
+      await notifyOwners(`🛡 <b>تقييد سبام تلقائي</b>\nالمستخدم: <code>${telegramId}</code>\nالمدة: <b>${protection.spamMuteMinutes} دقيقة</b>`);
+    }
+    return sendMessage(chatId, spamMutedText(minutesLeft), { replyMarkup: keyboardFor(admission.primary) });
+  }
+  if (spam.softLimited) {
+    return sendMessage(chatId, SPAM_SOFT_LIMIT_TEXT, { replyMarkup: keyboardFor(admission.primary) });
+  }
 
   const role = await getOwnerRole(telegramId);
-  if (!role && !admission.primary) {
+  if (!role && !admission.primary && !premium) {
     const missing = await checkForcedSubscriptions(telegramId);
     if (missing.length) {
       await sendMessage(chatId, subscriptionGateText(missing), { replyMarkup: subscriptionGateKeyboard(missing) });
@@ -608,6 +692,7 @@ async function handleDownloadCallback(callback: TelegramCallbackQuery) {
   const data = callback.data || "";
   const senderId = String(callback.from.id);
   const primary = await isPrimaryOwner(senderId);
+  const premium = await isPremiumUser(senderId);
   if (data === "sub_check") {
     if (!allowCallback(senderId)) return answerCallbackQuery(callback.id, "💡 أنت تضغط بسرعة. انتظر قليلاً ثم أعد المحاولة.");
     const missing = await checkForcedSubscriptions(senderId);
@@ -670,7 +755,7 @@ async function handleDownloadCallback(callback: TelegramCallbackQuery) {
   const job = await getMediaJob(jobId);
   if (!job || job.telegramId !== senderId || job.status !== "ready" || job.cancelRequested) return answerCallbackQuery(callback.id, "انتهت صلاحية هذا الطلب");
   const settings = await ensureBotSettings();
-  if (!primary && settings.usageLimitEnabled) {
+  if (!primary && !premium && settings.usageLimitEnabled) {
     const access = await getUserAccess(senderId);
     const subscribed = Boolean(access.subscriptionExpiresAt && access.subscriptionExpiresAt > Date.now());
     if (!subscribed) {
@@ -697,8 +782,8 @@ async function handleDownloadCallback(callback: TelegramCallbackQuery) {
       const beforeDownload = await getMediaJob(jobId);
       if (!beforeDownload || beforeDownload.cancelRequested) throw new DownloaderError("تم إلغاء العملية بنجاح.");
       await sendChatAction(chatId, action).catch(() => undefined);
-      if (allImages) return downloadAllImages(job.sourceUrl, jobId);
-      return downloadMedia(job.sourceUrl, choice, jobId);
+      if (allImages) return withAutoRetry(job.platform, () => downloadAllImages(job.sourceUrl, jobId));
+      return withAutoRetry(job.platform, () => downloadMedia(job.sourceUrl, choice, jobId));
     });
     const queueMessage = queued.position > 1
       ? `⏳ <b>طلبك في صف التنزيل</b> — أمامك <b>${queued.position - 1}</b> طلب. سيبدأ تلقائياً ويمكنك الإلغاء الآن.`
@@ -718,7 +803,7 @@ async function handleDownloadCallback(callback: TelegramCallbackQuery) {
     }
     await updateMediaJob(jobId, { status: "sent" });
     await notifyOwners(`✅ <b>تنزيل مكتمل</b>\nالمستخدم: <code>${senderId}</code>\nالنوع: <b>${allImages ? "صور كاملة" : mediaLabel(choice)}</b>\nالحجم: <b>${Math.round(output.bytes / 1024)} KB</b>\nالرابط: <code>${escapeHtml(job.sourceUrl.slice(0, 500))}</code>`);
-    if (!primary) await recordUserDownload(senderId, settings.usageLimitWindowHours);
+    if (!primary && !premium) await recordUserDownload(senderId, settings.usageLimitWindowHours);
   } catch (error) {
     if (error instanceof DownloaderError && error.message === "تم إلغاء العملية بنجاح.") return;
     if (error instanceof DownloadQueueError) {

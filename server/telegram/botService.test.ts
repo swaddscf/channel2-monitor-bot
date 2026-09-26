@@ -89,6 +89,7 @@ vi.mock("./telegramApi", () => ({
 }));
 
 import { buildReportNotification, processTelegramUpdate } from "./botService";
+import { resetProtectionForTests } from "./protection";
 import { OWNER_KEYBOARD, OWNER_LIMITS_KEYBOARD, subscriptionGateKeyboard, subscriptionOfferKeyboard, usageLimitExceededText, USER_KEYBOARD } from "./messages";
 
 function subscription(target: string, inviteUrl: string, kind = "channel") {
@@ -148,6 +149,7 @@ describe("معالجة تحديثات Telegram", () => {
     });
     stubs.getUserAccess.mockResolvedValue({ subscriptionExpiresAt: null, subscriptionPlanId: null, downloadTimestamps: [] });
     stubs.userDownloadsInWindow.mockResolvedValue(0);
+    resetProtectionForTests();
   });
 
   afterEach(() => {
@@ -333,7 +335,7 @@ describe("معالجة تحديثات Telegram", () => {
     stubs.isPrimaryOwner.mockResolvedValue(false);
     const { inspectMediaLink } = await import("./downloader");
     stubs.createMediaJob.mockResolvedValueOnce("retry-old").mockResolvedValueOnce("retry-new");
-    vi.mocked(inspectMediaLink).mockRejectedValueOnce(new Error("ERROR: [TikTok] 1: Unexpected response from webpage request"));
+    vi.mocked(inspectMediaLink).mockRejectedValue(new Error("ERROR: [TikTok] 1: Unexpected response from webpage request"));
     await processTelegramUpdate(userMessage(60, "https://vt.tiktok.com/ZSVXE4oUt/"));
     expect(stubs.updateMediaJob).toHaveBeenCalledWith("retry-old", { status: "failed" });
     expect(stubs.sendMessage).toHaveBeenCalledWith("901", expect.stringContaining("إعادة محاولة TikTok"), {

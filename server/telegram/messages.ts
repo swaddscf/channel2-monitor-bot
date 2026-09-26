@@ -126,6 +126,8 @@ export const OWNER_USERS_KEYBOARD = {
     [replyButton("👥 آخر المستخدمين", "primary"), replyButton("✅ النشطون", "primary")],
     [replyButton("🌙 غير النشطين", "primary"), replyButton("🚫 المحظورون", "primary")],
     [replyButton("🚫 حظر مستخدم", "danger"), replyButton("✅ فك الحظر", "success")],
+    [replyButton("⭐ إضافة مستخدم مميز", "success"), replyButton("✖️ إزالة مستخدم مميز", "danger")],
+    [replyButton("🌟 المميزون", "primary")],
     ...OWNER_FOOTER,
   ],
   resize_keyboard: true,
@@ -136,6 +138,7 @@ export const OWNER_SETTINGS_KEYBOARD = {
   keyboard: [
     [replyButton("⏱️ مدة التنظيف", "primary")],
     [replyButton("💳 الحدود والاشتراك", "primary")],
+    [replyButton("🛡 حماية السبام", "primary")],
     ...OWNER_FOOTER,
   ],
   resize_keyboard: true,
@@ -149,6 +152,15 @@ export const OWNER_LIMITS_KEYBOARD = {
     [replyButton("💳 وضع البوت: مدفوع", "success"), replyButton("🆓 وضع البوت: مجاني", "danger")],
     [replyButton("➕ إضافة حزمة", "success"), replyButton("⛔ إيقاف حزمة", "danger")],
     [replyButton("📋 قائمة الحزم", "primary")],
+    ...OWNER_FOOTER,
+  ],
+  resize_keyboard: true,
+  is_persistent: true,
+};
+
+export const OWNER_SPAM_KEYBOARD = {
+  keyboard: [
+    [replyButton("⏱️ مدة التقييد", "primary")],
     ...OWNER_FOOTER,
   ],
   resize_keyboard: true,
@@ -300,6 +312,37 @@ export function planCreatedText(plan: { name: string; durationDays: number; star
 
 export function subscriptionEndsLabel(expiresAt: number) {
   return new Date(expiresAt).toLocaleDateString("ar-EG", { day: "numeric", month: "long", year: "numeric" });
+}
+
+export function spamPageText(settings: { spamMuteMinutes: number }, premiumCount: number) {
+  return `🛡 <b>حماية السبام</b>
+
+يُحذَّر المستخدم الذي يتجاوز <b>5 طلبات في الدقيقة</b>، وعند تكرار التجاوز <b>3 مرات خلال 10 دقائق</b> يُقيَّد تلقائياً ولا يستقبل أي رابط.
+
+⏱️ مدة التقييد الحالية: <b>${settings.spamMuteMinutes} دقيقة</b>
+⭐ المستخدمون المميزون: <b>${premiumCount}</b> — معفون من الحد والتقييد.
+
+اضغط «⏱️ مدة التقييد» لتغيير المدة (1 إلى 1440 دقيقة).`;
+}
+
+export function spamMutedText(minutesLeft: number) {
+  return `🚫 <b>تم تقييدك مؤقتاً بسبب الإرسال المتكرر</b>
+
+سيعود استخدام البوت تلقائياً بعد <b>${minutesLeft} دقيقة</b>. انتظر ثم أرسل رابطك من جديد.`;
+}
+
+export const SPAM_SOFT_LIMIT_TEXT = "⏳ لديك طلبات كثيرة خلال الدقيقة. انتظر قليلاً ثم أرسل رابطاً جديداً، أو سيتم تقييدك مؤقتاً عند التكرار.";
+
+export function premiumListText(entries: Array<{ telegramId: string; displayName: string | null }>) {
+  if (!entries.length) {
+    return "⭐ لا يوجد مستخدمون مميزون حالياً.\n\nاضغط «⭐ إضافة مستخدم مميز» وأرسل المعرّف الرقمي للمستخدم.";
+  }
+  const lines = entries.map((entry, index) => `${index + 1}. ${entry.displayName ? `<b>${escapeHtml(entry.displayName)}</b> — ` : ""}<code>${escapeHtml(entry.telegramId)}</code>`);
+  return `⭐ <b>المستخدمون المميزون (${entries.length})</b>
+
+${lines.join("\n")}
+
+المميز يتنزّل بلا حدود، ويعفى من قيود السبام والاشتراك الإجباري. للإزالة اضغط «✖️ إزالة مستخدم مميز».`;
 }
 
 export function usageLimitExceededText(count: number, windowHours: number, hasPlans: boolean) {

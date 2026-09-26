@@ -4583,13 +4583,12 @@ function registerTelegramRoutes(app) {
     if (!matchesWebhookSecret(secret, suppliedSecret)) {
       return res.status(403).json({ ok: false, error: "invalid webhook secret" });
     }
-    try {
-      await processTelegramUpdate(req.body);
-      return res.status(200).json({ ok: true });
-    } catch (error) {
+    const update = req.body;
+    res.status(200).json({ ok: true });
+    void processTelegramUpdate(update).catch((error) => {
       console.error("[Telegram webhook] Update processing failed", error);
-      return res.status(500).json({ ok: false });
-    }
+    });
+    return;
   });
 }
 

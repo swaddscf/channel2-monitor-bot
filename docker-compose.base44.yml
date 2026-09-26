@@ -1,0 +1,35 @@
+# Base44 development compose — runs the app from the cloned source with live reload.
+# Single service: Express API + Vite dev middleware on one origin (port 3000).
+services:
+  app:
+    image: node:22-bookworm-slim
+    working_dir: /app
+    init: true
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - .:/app
+    environment:
+      # Development runtime: server/_core/index.ts serves the client through the
+      # Vite middleware (live reload) instead of the prebuilt dist/ bundle.
+      - NODE_ENV=development
+      - PORT=3000
+      - TRUST_PROXY=1
+      # Local trial mode: Telegram long polling instead of a webhook, so no public
+      # HTTPS domain is needed. Remove for production webhook deployments.
+      - TELEGRAM_POLLING=1
+    env_file:
+      # Platform-managed secrets (BOT_TOKEN, OWNER_ID, JWT_SECRET) — LAST, always wins.
+      - /run/base44/app.env
+    command: >
+      sh -ec '
+        if [ ! -x /usr/local/bin/pnpm ]; then npm install -g pnpm@10 >/dev/null 2>&1; fi;
+        if [ ! -d node_modules ]; then pnpm install; fi;
+        if ! command -v ffmpeg >/dev/null 2>&1; then
+          apt-get update -qq &&
+          apt-get install -y -qq --no-install-recommends ffmpeg python3 python3-pip &&
+          pip3 install --no-cache-dir --break-system-packages --no-compile yt-dlp;
+        fi;
+        exec pnpm dev
+      '

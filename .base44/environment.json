@@ -1,0 +1,23 @@
+{
+  "previewPort": 3000,
+  "healthPath": "/healthz",
+  "startCommand": "docker compose -f docker-compose.base44.yml up -d",
+  "secrets": [
+    {
+      "name": "BOT_TOKEN",
+      "description": "Telegram bot token from @BotFather; required for the bot to receive messages and download media.",
+      "requiredAtBoot": true
+    },
+    {
+      "name": "OWNER_ID",
+      "description": "Numeric Telegram user ID of the primary owner (not @username); controls who sees the owner panel.",
+      "requiredAtBoot": true
+    },
+    {
+      "name": "JWT_SECRET",
+      "description": "Server signing secret; also used to derive the Telegram webhook secret. A development placeholder was generated.",
+      "requiredAtBoot": false,
+      "generatedForDevelopment": true
+    }
+  ]
+}

@@ -9,7 +9,9 @@ let stopped = false;
 
 export function isPollingEnabled() {
   const value = (process.env.TELEGRAM_POLLING || "").trim().toLowerCase();
-  return value === "1" || value === "true" || value === "yes";
+  if (["0", "false", "no", "off"].includes(value)) return false;
+  if (["1", "true", "yes", "on"].includes(value)) return true;
+  return process.env.NODE_ENV === "production";
 }
 
 export async function startTelegramPolling() {
